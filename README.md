@@ -73,6 +73,21 @@ python binance_funding_monitor.py --start-date 2025-01-01
 python binance_funding_monitor.py --start-date 2025-01-01T08:00:00
 ```
 
+
+### 5) 启动网页版（默认 8081，不使用 8000）
+
+```bash
+python binance_funding_monitor.py --web --port 8081
+```
+
+打开浏览器访问：`http://127.0.0.1:8081`
+
+你可以在网页里：
+- 手动设置开始日期
+- 选择是否仅用历史重算
+- 调整回看窗口小时数
+- 一键刷新最新统计与图表
+
 ---
 
 ## 常用参数
@@ -83,6 +98,9 @@ python binance_funding_monitor.py --start-date 2025-01-01T08:00:00
 - `--start-date ...`
 - `--realized-window-hours 24`
 - `--skip-record`
+- `--web`
+- `--host 127.0.0.1`
+- `--port 8081`（默认，不占用 8000）
 
 ---
 

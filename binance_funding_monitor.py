@@ -13,6 +13,7 @@ import os
 import sys
 import urllib.parse
 from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Iterable
 from urllib import error, request
@@ -461,6 +462,9 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
         help="每次采集时回看多少小时已实现资金费（建议>=8，避免1h/4h/8h结算噪声）",
     )
     parser.add_argument("--skip-record", action="store_true", help="只读历史记录并计算，不向CSV追加新记录")
+    parser.add_argument("--web", action="store_true", help="启动网页版监控面板")
+    parser.add_argument("--host", default="127.0.0.1", help="Web 服务监听地址")
+    parser.add_argument("--port", type=int, default=8081, help="Web 服务端口（默认 8081，不使用 8000）")
     return parser.parse_args(list(argv))
 
 
@@ -484,23 +488,215 @@ def print_metrics(metrics: dict[str, float], start_date: dt.datetime | None) -> 
     print(f"费率年化(365天): {metrics['yearly_rate']*100:.6f}%")
 
 
+def run_pipeline(
+    args: argparse.Namespace,
+    start_dt: dt.datetime | None,
+    skip_record: bool,
+    realized_window_hours: int,
+) -> tuple[list[FundingSnapshot], dict[str, float]]:
+    if not skip_record:
+        api_key, api_secret = resolve_api_credentials(args)
+        client = BinanceClient(api_key, api_secret)
+        now = dt.datetime.now(dt.timezone.utc)
+        snapshot = collect_snapshot(client, now, realized_window_hours=realized_window_hours)
+        save_record(snapshot, args.record_file)
+
+    records = load_records(args.record_file, start_dt)
+    metrics = compute_metrics(records)
+    write_summary_csv(metrics, args.summary_csv)
+    build_charts(records, metrics, args.chart_file)
+    return records, metrics
+
+
+def build_dashboard_html() -> str:
+    return """<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Binance 资金费用监控面板</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 24px; background: #f6f8fb; color: #222; }
+    h1 { margin-bottom: 12px; }
+    .card { background: #fff; border: 1px solid #e5e8ef; border-radius: 10px; padding: 16px; margin-bottom: 16px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 10px; }
+    .metric { background: #fafbfe; border: 1px solid #edf1f8; border-radius: 8px; padding: 10px; }
+    .metric .label { font-size: 12px; color: #666; }
+    .metric .value { font-size: 20px; font-weight: 600; margin-top: 4px; }
+    .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    input, button { padding: 8px 10px; border: 1px solid #cfd6e4; border-radius: 6px; font-size: 14px; }
+    button { background: #2d6cdf; color: #fff; cursor: pointer; border-color: #2d6cdf; }
+    button:hover { background: #1f5bc5; }
+    #error { color: #b00020; min-height: 20px; }
+    iframe { width: 100%; height: 520px; border: 1px solid #e5e8ef; border-radius: 8px; background: #fff; }
+  </style>
+</head>
+<body>
+  <h1>Binance 合约资金费用监控（Web）</h1>
+  <div class="card">
+    <div class="row">
+      <label>开始日期(UTC): <input id="startDate" placeholder="2025-01-01 或 2025-01-01T08:00:00" /></label>
+      <label>回看小时: <input id="windowHours" type="number" value="24" min="1" /></label>
+      <label><input id="skipRecord" type="checkbox" checked /> 仅用历史重算（不追加记录）</label>
+      <button id="refreshBtn">刷新</button>
+    </div>
+    <p id="error"></p>
+  </div>
+
+  <div class="card grid" id="metrics"></div>
+
+  <div class="card">
+    <h3>最新图表（SVG）</h3>
+    <iframe id="chartFrame" src="/chart"></iframe>
+  </div>
+
+  <script>
+    const labels = [
+      ['count','样本数'],
+      ['total_realized','总已实现资金费(USDT)'],
+      ['avg_hourly_realized','平均每小时已实现(USDT)'],
+      ['avg_estimated_hourly_fee','平均每小时估算(USDT)'],
+      ['daily_fee','资金费日化(USDT)'],
+      ['monthly_fee','资金费月化(USDT)'],
+      ['yearly_fee','资金费年化(USDT)'],
+      ['avg_weighted_rate_per_hour','加权每小时费率'],
+      ['daily_rate','费率日化'],
+      ['monthly_rate','费率月化'],
+      ['yearly_rate','费率年化'],
+    ];
+
+    function fmtPercent(key, v){
+      if(['avg_weighted_rate_per_hour','daily_rate','monthly_rate','yearly_rate'].includes(key)){
+        return (v * 100).toFixed(6) + '%';
+      }
+      if(key === 'count') return String(Math.round(v));
+      return Number(v).toFixed(8);
+    }
+
+    async function refresh() {
+      const error = document.getElementById('error');
+      error.textContent = '';
+      const startDate = document.getElementById('startDate').value.trim();
+      const skipRecord = document.getElementById('skipRecord').checked ? '1' : '0';
+      const windowHours = document.getElementById('windowHours').value;
+      const q = new URLSearchParams({ skip_record: skipRecord, realized_window_hours: windowHours });
+      if (startDate) q.set('start_date', startDate);
+
+      try {
+        const resp = await fetch('/api/metrics?' + q.toString());
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data.error || '请求失败');
+
+        const metricsEl = document.getElementById('metrics');
+        metricsEl.innerHTML = labels.map(([k, t]) =>
+          `<div class="metric"><div class="label">${t}</div><div class="value">${fmtPercent(k, data.metrics[k] ?? 0)}</div></div>`
+        ).join('');
+
+        document.getElementById('chartFrame').src = '/chart?t=' + Date.now();
+      } catch (e) {
+        error.textContent = e.message;
+      }
+    }
+
+    document.getElementById('refreshBtn').addEventListener('click', refresh);
+    refresh();
+  </script>
+</body>
+</html>
+"""
+
+
+def make_handler(args: argparse.Namespace):
+    class DashboardHandler(BaseHTTPRequestHandler):
+        def _send_json(self, status: int, payload: dict[str, object]) -> None:
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self) -> None:  # noqa: N802
+            parsed = urllib.parse.urlparse(self.path)
+            if parsed.path == "/":
+                body = build_dashboard_html().encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+
+            if parsed.path == "/chart":
+                if args.chart_file.exists():
+                    body = args.chart_file.read_bytes()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "image/svg+xml; charset=utf-8")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                else:
+                    self._send_json(404, {"error": "图表文件不存在，请先刷新数据"})
+                return
+
+            if parsed.path == "/api/metrics":
+                query = urllib.parse.parse_qs(parsed.query)
+                start = query.get("start_date", [""])[0].strip()
+                start_dt = parse_datetime(start) if start else None
+                skip_record = query.get("skip_record", ["1"])[0] != "0"
+                try:
+                    realized_window_hours = int(query.get("realized_window_hours", [str(args.realized_window_hours)])[0])
+                except ValueError:
+                    realized_window_hours = args.realized_window_hours
+
+                try:
+                    _, metrics = run_pipeline(
+                        args,
+                        start_dt=start_dt,
+                        skip_record=skip_record,
+                        realized_window_hours=realized_window_hours,
+                    )
+                except (RuntimeError, error.HTTPError, error.URLError, ValueError) as exc:
+                    self._send_json(400, {"error": str(exc)})
+                    return
+
+                self._send_json(200, {"metrics": metrics})
+                return
+
+            self._send_json(404, {"error": "Not Found"})
+
+    return DashboardHandler
+
+
+def run_web_server(args: argparse.Namespace) -> int:
+    handler = make_handler(args)
+    server = ThreadingHTTPServer((args.host, args.port), handler)
+    print(f"[INFO] Web 面板启动: http://{args.host}:{args.port} (默认不是 8000)")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+    return 0
+
+
 def main(argv: Iterable[str]) -> int:
     args = parse_args(argv)
     start_dt = parse_datetime(args.start_date) if args.start_date else None
 
-    try:
-        if not args.skip_record:
-            api_key, api_secret = resolve_api_credentials(args)
-            client = BinanceClient(api_key, api_secret)
-            now = dt.datetime.now(dt.timezone.utc)
-            snapshot = collect_snapshot(client, now, realized_window_hours=args.realized_window_hours)
-            save_record(snapshot, args.record_file)
-            print(f"[INFO] 已写入小时记录: {args.record_file}")
+    if args.web:
+        return run_web_server(args)
 
-        records = load_records(args.record_file, start_dt)
-        metrics = compute_metrics(records)
-        write_summary_csv(metrics, args.summary_csv)
-        build_charts(records, metrics, args.chart_file)
+    try:
+        records, metrics = run_pipeline(
+            args,
+            start_dt=start_dt,
+            skip_record=args.skip_record,
+            realized_window_hours=args.realized_window_hours,
+        )
+        if not args.skip_record:
+            print(f"[INFO] 已写入小时记录: {args.record_file}")
         print_metrics(metrics, start_dt)
         print(f"\n汇总CSV: {args.summary_csv}")
         print(f"图表SVG: {args.chart_file}")
