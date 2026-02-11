@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Binance USDⓈ-M funding fee tracker with weighted annualization and SVG charts."""
+"""Binance USDⓈ-M funding fee tracker with interval-aware annualization and SVG charts."""
 
 from __future__ import annotations
 
@@ -21,15 +21,18 @@ BASE_URL = "https://fapi.binance.com"
 PREMIUM_INDEX_PATH = "/fapi/v1/premiumIndex"
 POSITION_RISK_PATH = "/fapi/v2/positionRisk"
 INCOME_HISTORY_PATH = "/fapi/v1/income"
+FUNDING_INFO_PATH = "/fapi/v1/fundingInfo"
 
 
 @dataclass
 class FundingSnapshot:
     timestamp: dt.datetime
-    realized_fee_1h: float
+    realized_fee_window: float
+    realized_window_hours: float
     estimated_next_fee: float
+    estimated_hourly_fee: float
     total_abs_notional: float
-    weighted_rate_8h: float
+    weighted_rate_per_hour: float
 
 
 class BinanceClient:
@@ -45,13 +48,19 @@ class BinanceClient:
         encoded = urllib.parse.urlencode(query, doseq=True)
         signature = hmac.new(self.api_secret, encoded.encode("utf-8"), hashlib.sha256).hexdigest()
         url = f"{BASE_URL}{path}?{encoded}&signature={signature}"
-        req = request.Request(url=url, headers={"X-MBX-APIKEY": self.api_key, "User-Agent": "funding-tracker/2.0"})
+        req = request.Request(
+            url=url,
+            headers={"X-MBX-APIKEY": self.api_key, "User-Agent": "funding-tracker/3.0"},
+        )
         with request.urlopen(req, timeout=30) as resp:
             payload = resp.read().decode("utf-8")
         return json.loads(payload)
 
     def _public_request(self, path: str) -> object:
-        req = request.Request(url=f"{BASE_URL}{path}", headers={"User-Agent": "funding-tracker/2.0"})
+        req = request.Request(
+            url=f"{BASE_URL}{path}",
+            headers={"User-Agent": "funding-tracker/3.0"},
+        )
         with request.urlopen(req, timeout=30) as resp:
             payload = resp.read().decode("utf-8")
         return json.loads(payload)
@@ -76,6 +85,22 @@ class BinanceClient:
             if symbol:
                 rates[symbol] = rate
         return rates
+
+    def get_funding_intervals(self) -> dict[str, int]:
+        """Return funding interval hours per symbol. Binance default is 8h if missing."""
+        data = self._public_request(FUNDING_INFO_PATH)
+        intervals: dict[str, int] = {}
+        if isinstance(data, list):
+            for item in data:
+                symbol = item.get("symbol")
+                raw = item.get("fundingIntervalHours")
+                try:
+                    hours = int(raw)
+                except (TypeError, ValueError):
+                    continue
+                if symbol and hours > 0:
+                    intervals[symbol] = hours
+        return intervals
 
     def get_funding_income_sum(self, start: dt.datetime, end: dt.datetime) -> float:
         start_ms = int(start.timestamp() * 1000)
@@ -127,17 +152,21 @@ def resolve_api_credentials(args: argparse.Namespace) -> tuple[str, str]:
     api_key = args.api_key or os.getenv("BINANCE_API_KEY")
     api_secret = args.api_secret or os.getenv("BINANCE_API_SECRET")
     if not api_key or not api_secret:
-        raise RuntimeError("API key/secret missing. Use --api-key/--api-secret or env BINANCE_API_KEY/BINANCE_API_SECRET")
+        raise RuntimeError(
+            "API key/secret missing. Use --api-key/--api-secret or env BINANCE_API_KEY/BINANCE_API_SECRET"
+        )
     return api_key, api_secret
 
 
 def collect_snapshot(client: BinanceClient, now: dt.datetime, realized_window_hours: int) -> FundingSnapshot:
     positions = client.get_positions()
     rates = client.get_premium_index()
+    intervals = client.get_funding_intervals()
 
     total_abs_notional = 0.0
-    weighted_rate_sum = 0.0
+    weighted_rate_hourly_sum = 0.0
     estimated_next_fee = 0.0
+    estimated_hourly_fee = 0.0
 
     for row in positions:
         try:
@@ -149,23 +178,42 @@ def collect_snapshot(client: BinanceClient, now: dt.datetime, realized_window_ho
             continue
 
         symbol = row.get("symbol")
+        if not symbol:
+            continue
+
         rate = rates.get(symbol, 0.0)
+        interval_h = float(intervals.get(symbol, 8))
+        if interval_h <= 0:
+            interval_h = 8.0
+
         notional = amt * mark_price
         abs_notional = abs(notional)
 
-        total_abs_notional += abs_notional
-        weighted_rate_sum += rate * abs_notional
+        # next settlement cashflow (for this symbol interval)
         estimated_next_fee += notional * rate
+        # normalized hourly expected cashflow to handle 1h/4h/8h symbols together
+        estimated_hourly_fee += (notional * rate) / interval_h
 
-    weighted_rate_8h = weighted_rate_sum / total_abs_notional if total_abs_notional > 0 else 0.0
-    realized_fee_1h = client.get_funding_income_sum(now - dt.timedelta(hours=realized_window_hours), now)
+        total_abs_notional += abs_notional
+        weighted_rate_hourly_sum += (rate / interval_h) * abs_notional
+
+    weighted_rate_per_hour = (
+        weighted_rate_hourly_sum / total_abs_notional if total_abs_notional > 0 else 0.0
+    )
+
+    window_h = float(realized_window_hours)
+    if window_h <= 0:
+        window_h = 1.0
+    realized_fee_window = client.get_funding_income_sum(now - dt.timedelta(hours=window_h), now)
 
     return FundingSnapshot(
         timestamp=now,
-        realized_fee_1h=realized_fee_1h,
+        realized_fee_window=realized_fee_window,
+        realized_window_hours=window_h,
         estimated_next_fee=estimated_next_fee,
+        estimated_hourly_fee=estimated_hourly_fee,
         total_abs_notional=total_abs_notional,
-        weighted_rate_8h=weighted_rate_8h,
+        weighted_rate_per_hour=weighted_rate_per_hour,
     )
 
 
@@ -178,19 +226,23 @@ def save_record(snapshot: FundingSnapshot, csv_path: Path) -> None:
             writer.writerow(
                 [
                     "timestamp_utc",
-                    "realized_fee_1h",
-                    "estimated_next_fee_8h",
+                    "realized_fee_window",
+                    "realized_window_hours",
+                    "estimated_next_fee",
+                    "estimated_hourly_fee",
                     "total_abs_notional",
-                    "weighted_rate_8h",
+                    "weighted_rate_per_hour",
                 ]
             )
         writer.writerow(
             [
                 snapshot.timestamp.isoformat(),
-                f"{snapshot.realized_fee_1h:.12f}",
+                f"{snapshot.realized_fee_window:.12f}",
+                f"{snapshot.realized_window_hours:.12f}",
                 f"{snapshot.estimated_next_fee:.12f}",
+                f"{snapshot.estimated_hourly_fee:.12f}",
                 f"{snapshot.total_abs_notional:.12f}",
-                f"{snapshot.weighted_rate_8h:.12f}",
+                f"{snapshot.weighted_rate_per_hour:.12f}",
             ]
         )
 
@@ -205,21 +257,27 @@ def load_records(csv_path: Path, start_time: dt.datetime | None) -> list[Funding
         for row in reader:
             try:
                 ts = parse_datetime(row["timestamp_utc"])
-                realized = float(row["realized_fee_1h"])
-                estimated = float(row["estimated_next_fee_8h"])
+                realized = float(row["realized_fee_window"])
+                window_h = float(row["realized_window_hours"])
+                est_next = float(row["estimated_next_fee"])
+                est_hourly = float(row["estimated_hourly_fee"])
                 abs_notional = float(row["total_abs_notional"])
-                rate = float(row["weighted_rate_8h"])
+                rate_h = float(row["weighted_rate_per_hour"])
             except (KeyError, TypeError, ValueError):
+                continue
+            if window_h <= 0:
                 continue
             if start_time and ts < start_time:
                 continue
             records.append(
                 FundingSnapshot(
                     timestamp=ts,
-                    realized_fee_1h=realized,
-                    estimated_next_fee=estimated,
+                    realized_fee_window=realized,
+                    realized_window_hours=window_h,
+                    estimated_next_fee=est_next,
+                    estimated_hourly_fee=est_hourly,
                     total_abs_notional=abs_notional,
-                    weighted_rate_8h=rate,
+                    weighted_rate_per_hour=rate_h,
                 )
             )
     return records
@@ -228,39 +286,49 @@ def load_records(csv_path: Path, start_time: dt.datetime | None) -> list[Funding
 def compute_metrics(records: list[FundingSnapshot]) -> dict[str, float]:
     if not records:
         return {
-            "count": 0,
+            "count": 0.0,
+            "total_realized": 0.0,
             "avg_hourly_realized": 0.0,
             "daily_fee": 0.0,
             "monthly_fee": 0.0,
             "yearly_fee": 0.0,
-            "avg_weighted_rate_8h": 0.0,
+            "avg_weighted_rate_per_hour": 0.0,
             "daily_rate": 0.0,
             "monthly_rate": 0.0,
             "yearly_rate": 0.0,
-            "total_realized": 0.0,
+            "avg_estimated_hourly_fee": 0.0,
         }
 
-    count = len(records)
-    total_realized = sum(r.realized_fee_1h for r in records)
-    avg_hourly_realized = total_realized / count
+    count = float(len(records))
+
+    total_realized = sum(r.realized_fee_window for r in records)
+    total_covered_hours = sum(r.realized_window_hours for r in records)
+    avg_hourly_realized = total_realized / total_covered_hours if total_covered_hours > 0 else 0.0
 
     sum_notional = sum(r.total_abs_notional for r in records)
     if sum_notional > 0:
-        avg_weighted_rate_8h = sum(r.weighted_rate_8h * r.total_abs_notional for r in records) / sum_notional
+        avg_weighted_rate_per_hour = (
+            sum(r.weighted_rate_per_hour * r.total_abs_notional for r in records) / sum_notional
+        )
     else:
-        avg_weighted_rate_8h = 0.0
+        avg_weighted_rate_per_hour = 0.0
+
+    avg_estimated_hourly_fee = (
+        sum(r.estimated_hourly_fee for r in records) / count if count > 0 else 0.0
+    )
 
     return {
-        "count": float(count),
+        "count": count,
+        "total_realized": total_realized,
         "avg_hourly_realized": avg_hourly_realized,
         "daily_fee": avg_hourly_realized * 24,
         "monthly_fee": avg_hourly_realized * 24 * 30,
         "yearly_fee": avg_hourly_realized * 24 * 365,
-        "avg_weighted_rate_8h": avg_weighted_rate_8h,
-        "daily_rate": avg_weighted_rate_8h * 3,
-        "monthly_rate": avg_weighted_rate_8h * 90,
-        "yearly_rate": avg_weighted_rate_8h * 1095,
-        "total_realized": total_realized,
+        "avg_weighted_rate_per_hour": avg_weighted_rate_per_hour,
+        "daily_rate": avg_weighted_rate_per_hour * 24,
+        "monthly_rate": avg_weighted_rate_per_hour * 24 * 30,
+        "yearly_rate": avg_weighted_rate_per_hour * 24 * 365,
+        "avg_estimated_hourly_fee": avg_estimated_hourly_fee,
     }
 
 
@@ -293,15 +361,18 @@ def build_charts(records: list[FundingSnapshot], metrics: dict[str, float], outp
         '<text x="750" y="42" text-anchor="middle" font-size="28" font-family="Arial">Binance Funding Fee Monitor</text>',
     ]
 
-    # Panel 1: cumulative realized funding fee line chart.
     p1 = {"x": 90, "y": 90, "w": 1320, "h": 430}
-    parts.append(f'<rect x="{p1["x"]}" y="{p1["y"]}" width="{p1["w"]}" height="{p1["h"]}" fill="#fafafa" stroke="#dddddd"/>')
-    parts.append('<text x="105" y="120" font-size="18" font-family="Arial">Cumulative Realized Funding Fee (USDT)</text>')
+    parts.append(
+        f'<rect x="{p1["x"]}" y="{p1["y"]}" width="{p1["w"]}" height="{p1["h"]}" fill="#fafafa" stroke="#dddddd"/>'
+    )
+    parts.append(
+        '<text x="105" y="120" font-size="18" font-family="Arial">Cumulative Realized Funding Fee (USDT)</text>'
+    )
 
     cumulative = []
     total = 0.0
     for row in records:
-        total += row.realized_fee_1h
+        total += row.realized_fee_window
         cumulative.append(total)
 
     if cumulative:
@@ -321,16 +392,12 @@ def build_charts(records: list[FundingSnapshot], metrics: dict[str, float], outp
 
         poly = " ".join(f"{map_x(i):.1f},{map_y(v):.1f}" for i, v in enumerate(cumulative))
         parts.append(f'<polyline fill="none" stroke="#1f77b4" stroke-width="2.5" points="{poly}"/>')
-        for tick in range(5):
-            val = min_v + (max_v - min_v) * tick / 4
-            y = map_y(val)
-            parts.append(f'<line x1="{p1["x"]}" y1="{y:.1f}" x2="{p1["x"]+p1["w"]}" y2="{y:.1f}" stroke="#efefef"/>')
-            parts.append(f'<text x="{p1["x"]-10}" y="{y+4:.1f}" text-anchor="end" font-size="12" font-family="Arial">{val:.4f}</text>')
 
-    # Panel 2: annualized rates bar chart.
     p2 = {"x": 90, "y": 560, "w": 650, "h": 290}
-    parts.append(f'<rect x="{p2["x"]}" y="{p2["y"]}" width="{p2["w"]}" height="{p2["h"]}" fill="#fafafa" stroke="#dddddd"/>')
-    parts.append('<text x="105" y="590" font-size="18" font-family="Arial">Weighted Funding Rate Annualization</text>')
+    parts.append(
+        f'<rect x="{p2["x"]}" y="{p2["y"]}" width="{p2["w"]}" height="{p2["h"]}" fill="#fafafa" stroke="#dddddd"/>'
+    )
+    parts.append('<text x="105" y="590" font-size="18" font-family="Arial">Annualized Weighted Funding Rate</text>')
     rate_vals = [
         ("Daily", metrics["daily_rate"] * 100),
         ("Monthly", metrics["monthly_rate"] * 100),
@@ -346,25 +413,31 @@ def build_charts(records: list[FundingSnapshot], metrics: dict[str, float], outp
         y = base_y - h if val >= 0 else base_y
         color = "#2ca02c" if val >= 0 else "#d62728"
         parts.append(f'<rect x="{x}" y="{y:.1f}" width="{bar_w}" height="{h:.1f}" fill="{color}"/>')
-        parts.append(f'<text x="{x+bar_w/2}" y="{base_y+22}" text-anchor="middle" font-size="13" font-family="Arial">{name}</text>')
-        parts.append(f'<text x="{x+bar_w/2}" y="{y-8:.1f}" text-anchor="middle" font-size="12" font-family="Arial">{val:.4f}%</text>')
+        parts.append(
+            f'<text x="{x+bar_w/2}" y="{base_y+22}" text-anchor="middle" font-size="13" font-family="Arial">{name}</text>'
+        )
+        parts.append(
+            f'<text x="{x+bar_w/2}" y="{y-8:.1f}" text-anchor="middle" font-size="12" font-family="Arial">{val:.4f}%</text>'
+        )
 
-    # Panel 3: annualized fee numbers.
     p3 = {"x": 770, "y": 560, "w": 640, "h": 290}
-    parts.append(f'<rect x="{p3["x"]}" y="{p3["y"]}" width="{p3["w"]}" height="{p3["h"]}" fill="#fafafa" stroke="#dddddd"/>')
-    parts.append('<text x="785" y="590" font-size="18" font-family="Arial">Realized Funding Fee Projection</text>')
+    parts.append(
+        f'<rect x="{p3["x"]}" y="{p3["y"]}" width="{p3["w"]}" height="{p3["h"]}" fill="#fafafa" stroke="#dddddd"/>'
+    )
+    parts.append('<text x="785" y="590" font-size="18" font-family="Arial">Funding Projection Summary</text>')
 
     info_lines = [
         f"Samples: {int(metrics['count'])}",
         f"Total realized: {metrics['total_realized']:.8f} USDT",
         f"Avg hourly realized: {metrics['avg_hourly_realized']:.8f} USDT",
+        f"Avg hourly estimated: {metrics['avg_estimated_hourly_fee']:.8f} USDT",
         f"Daily projection: {metrics['daily_fee']:.8f} USDT",
         f"Monthly projection: {metrics['monthly_fee']:.8f} USDT",
         f"Yearly projection: {metrics['yearly_fee']:.8f} USDT",
-        f"Weighted avg 8h rate: {metrics['avg_weighted_rate_8h']*100:.6f}%",
+        f"Weighted avg hourly rate: {metrics['avg_weighted_rate_per_hour']*100:.6f}%",
     ]
     for idx, line in enumerate(info_lines):
-        y = 630 + idx * 30
+        y = 620 + idx * 28
         parts.append(
             f'<text x="790" y="{y}" font-size="16" font-family="Arial" fill="#222222">{_escape_xml(line)}</text>'
         )
@@ -381,26 +454,32 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
     parser.add_argument("--summary-csv", type=Path, default=Path("output/funding_summary.csv"), help="汇总结果CSV")
     parser.add_argument("--chart-file", type=Path, default=Path("output/funding_summary.svg"), help="汇总图表SVG")
     parser.add_argument("--start-date", help="统计起始时间，支持 2025-01-01 或 2025-01-01T08:00:00")
-    parser.add_argument("--realized-window-hours", type=int, default=1, help="每次采集时回看的已实现资金费窗口（小时）")
+    parser.add_argument(
+        "--realized-window-hours",
+        type=int,
+        default=24,
+        help="每次采集时回看多少小时已实现资金费（建议>=8，避免1h/4h/8h结算噪声）",
+    )
     parser.add_argument("--skip-record", action="store_true", help="只读历史记录并计算，不向CSV追加新记录")
     return parser.parse_args(list(argv))
 
 
 def print_metrics(metrics: dict[str, float], start_date: dt.datetime | None) -> None:
     print("=" * 72)
-    print("Binance 资金费用统计（加权）")
+    print("Binance 资金费用统计（结算周期已处理：1h/4h/8h）")
     print("=" * 72)
     if start_date:
         print(f"统计起始时间(UTC): {start_date.isoformat()}")
     print(f"样本数量: {int(metrics['count'])}")
     print(f"总已实现资金费: {metrics['total_realized']:.8f} USDT")
     print(f"平均每小时已实现资金费: {metrics['avg_hourly_realized']:.8f} USDT")
+    print(f"平均每小时估算资金费: {metrics['avg_estimated_hourly_fee']:.8f} USDT")
     print(f"资金费投影(日化): {metrics['daily_fee']:.8f} USDT")
     print(f"资金费投影(月化): {metrics['monthly_fee']:.8f} USDT")
     print(f"资金费投影(年化): {metrics['yearly_fee']:.8f} USDT")
     print("-" * 72)
-    print(f"加权平均8h费率: {metrics['avg_weighted_rate_8h']*100:.6f}%")
-    print(f"费率日化(3次/天): {metrics['daily_rate']*100:.6f}%")
+    print(f"加权平均每小时费率: {metrics['avg_weighted_rate_per_hour']*100:.6f}%")
+    print(f"费率日化: {metrics['daily_rate']*100:.6f}%")
     print(f"费率月化(30天): {metrics['monthly_rate']*100:.6f}%")
     print(f"费率年化(365天): {metrics['yearly_rate']*100:.6f}%")
 
