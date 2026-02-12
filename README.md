@@ -1,50 +1,32 @@
-# Binance 合约资金费用监控（支持 1h/4h/8h 结算周期）
+# Binance 资金费监控（完全改版：仅增量记录 + 动态图表）
 
-这个脚本支持你描述的实际场景：**持仓会变化、不同币对结算周期不同、按小时持续记录并用历史加权统计**。
+按你的要求，这一版是**流式增量模式**：
 
-核心能力：
+- ❌ 不回算之前历史
+- ✅ 只从当前启动时刻开始，不停记录新的
+- ✅ 每次新样本进来后做增量加权
+- ✅ 动态网页实时展示指标和曲线
 
-- 读取 Binance USDⓈ-M 持仓（动态变化）。
-- 统计已实现资金费的三种口径：净值、收到(正收入)、支付(负支出)。
-- 读取每个持仓币对的资金费率并估算：
-  - 下一次结算资金费（next fee）
-  - 按结算周期折算后的每小时估算资金费（hourly normalized）
-- 自动识别各币对结算周期（1h / 4h / 8h，默认缺省按 8h）。
-- 每次运行追加一条记录到 CSV。
-- 可按 `--start-date` 读取历史并重新计算加权统计。
-- 生成 SVG 图表（累计资金费 + 年化费率 + 统计面板）。
+默认端口：`8081`（不使用 8000）。
 
 ---
 
-## 为什么之前会“数据看起来不对”
+## 功能
 
-如果把一次结算资金费（例如 8 小时一次）直接当成“1 小时收益”去年化，会被放大 8 倍。
-
-当前版本已修正：
-
-1. **费率年化**使用“每小时费率”统一口径：
-   - `hourly_rate = funding_rate / interval_hours`
-   - 再换算到日/月/年。
-2. **资金费金额年化**基于“覆盖小时数”计算：
-   - `avg_hourly_realized = sum(realized_fee_window) / sum(realized_window_hours)`
-   - 避免 1h/4h/8h 不同结算频率造成误判。
-
----
-
-## 环境要求
-
-- Python 3.9+
-- 无第三方依赖（仅标准库）
+- 持续采集 Binance USDⓈ-M 资金费相关数据。
+- 自动处理 1h/4h/8h 结算周期（按小时归一后再加权）。
+- 资金费拆分为：
+  - 净值（net）
+  - 收到（received）
+  - 支付（paid）
+- 增量更新日化/月化/年化。
+- 动态网页（自动刷新）：
+  - 指标卡片
+  - 三条动态线：净/收到/支付（USDT/h）
 
 ---
 
-## API 权限
-
-Binance API Key 需具备 Futures 读取权限（读取持仓、资金费流水）。
-
----
-
-## 使用方式
+## 运行方式
 
 ### 1) 设置 API
 
@@ -53,70 +35,55 @@ export BINANCE_API_KEY="你的KEY"
 export BINANCE_API_SECRET="你的SECRET"
 ```
 
-### 2) 正常采集（会追加一条记录）
+### 2) 启动动态网页（推荐）
 
 ```bash
-python binance_funding_monitor.py
+python binance_funding_monitor.py --web --port 8081 --interval-seconds 3600
 ```
 
-> 默认 `--realized-window-hours 24`，用于减少 1h/4h/8h 结算噪声。
+浏览器打开：`http://127.0.0.1:8081`
 
-### 3) 只读取历史重算（不追加新记录）
+### 3) 仅命令行持续采集
 
 ```bash
-python binance_funding_monitor.py --skip-record
+python binance_funding_monitor.py --interval-seconds 3600
 ```
 
-### 4) 手动选择统计起始日期
+### 4) 调试单次采样
 
 ```bash
-python binance_funding_monitor.py --start-date 2025-01-01
-python binance_funding_monitor.py --start-date 2025-01-01T08:00:00
+python binance_funding_monitor.py --once
 ```
 
-
-### 5) 启动网页版（默认 8081，不使用 8000）
+### 5) 无 API 本地演示模式
 
 ```bash
-python binance_funding_monitor.py --web --port 8081
+python binance_funding_monitor.py --web --demo-mode --interval-seconds 5
 ```
-
-打开浏览器访问：`http://127.0.0.1:8081`
-
-你可以在网页里：
-- 手动设置开始日期
-- 选择是否仅用历史重算
-- 调整回看窗口小时数
-- 一键刷新最新统计与图表
 
 ---
 
-## 常用参数
+## 关键参数
 
-- `--record-file output/funding_records.csv`
-- `--summary-csv output/funding_summary.csv`
-- `--chart-file output/funding_summary.svg`
-- `--start-date ...`
-- `--realized-window-hours 24`
-- `--skip-record`
-- `--web`
-- `--host 127.0.0.1`
+- `--web`：启动网页模式
+- `--host 0.0.0.0`
 - `--port 8081`（默认，不占用 8000）
+- `--interval-seconds 3600`：采样间隔
+- `--realized-window-hours 24`：每次采集回看窗口小时数
+- `--record-file output/funding_records_stream.csv`
+- `--summary-csv output/funding_summary_stream.csv`
+- `--chart-points 120`：动态图保留最近N点
+- `--resume`：续写记录文件（默认不续写，启动时重置文件）
+- `--demo-mode`：本地模拟数据，不调用 Binance API
 
 ---
 
-## 输出文件
+## 关于“不回算之前的”
 
-- `output/funding_records.csv`：小时记录（含净值/收到/支付）
-- `output/funding_summary.csv`：汇总指标
-- `output/funding_summary.svg`：图表
+默认行为：
 
----
+- 启动服务时会重置本次记录文件（新会话）
+- 统计完全来自本次会话之后的新采样
+- 不读取旧 CSV 做历史重算
 
-## 建议定时任务（每小时）
-
-```cron
-0 * * * * /usr/bin/python3 /path/to/binance_funding_monitor.py >> /path/to/output/cron.log 2>&1
-```
-
-持续运行后，你可以随时指定 `--start-date` 基于历史重算统计。
+如果你想续写文件，可加 `--resume`，但依然不会把旧数据再扫描回算到当前会话统计里。
