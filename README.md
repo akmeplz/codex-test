@@ -9,7 +9,7 @@
 
 并且新增：
 
-- **采集时间：每小时开始的第 60 秒（UTC）**
+- **默认采集频率：1秒1采（可切到整点+60秒）**
 - 展示 **仓位价值**、**账户总权益**、**实际杠杆**
 
 默认端口：`8081`（不使用 8000）。
@@ -43,14 +43,17 @@ python binance_funding_monitor.py --web --demo-mode --port 8081
 
 ## 采集规则
 
-默认按 UTC 时间：
+默认：
 
-- 00:01:00
-- 01:01:00
-- 02:01:00
-- ...
+- 每 **1 秒**采集一次
+- 页面每 **1 秒**刷新一次
 
-即每小时开始后的第 60 秒采集一次。
+如果你要切回整点采样，可使用：
+
+```bash
+python binance_funding_monitor.py --web --align-to-hour --sample-offset-seconds 60
+```
+
 
 ---
 
@@ -70,8 +73,9 @@ python binance_funding_monitor.py --web --demo-mode --port 8081
 - `--web`
 - `--host 0.0.0.0`
 - `--port 8081`
-- `--sample-offset-seconds 60`（每小时第 N 秒采集）
-- `--align-to-hour`（默认开启）
+- `--interval-seconds 1`（默认1秒1采）
+- `--align-to-hour`（默认关闭，开启后按整点偏移秒采）
+- `--sample-offset-seconds 60`（整点模式下每小时第 N 秒采集）
 - `--record-file output/funding_records_stream.csv`
 - `--summary-csv output/funding_summary_stream.csv`
 - `--chart-points 120`
@@ -83,7 +87,7 @@ python binance_funding_monitor.py --web --demo-mode --port 8081
 
 ## 说明
 
-默认会在启动时先采样 1 条用于初始化页面，然后后续按“每小时第60秒”继续采集。
+默认会在启动时先采样 1 条用于初始化页面，然后按你设置的采样规则继续采集（默认1秒1采）。
 
 
 ---

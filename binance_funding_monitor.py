@@ -474,7 +474,7 @@ body{font-family:Arial,sans-serif;margin:20px;background:#f7f9fc;color:#222}
 canvas{width:100%;height:360px;border:1px solid #e5eaf3;border-radius:8px;background:#fff}
 </style></head><body>
 <h2>Binance 资金费动态监控（仅增量，不回算历史）</h2>
-<div class=\"card\">采样规则：每小时开始第 60 秒采集（UTC），图表每 5 秒刷新。</div>
+<div class=\"card\">采样规则：默认 1 秒采集 1 次、1 秒刷新 1 次（可改参数）。</div>
 <div class=\"card grid\" id=\"metrics\"></div>
 <div class=\"card\"><canvas id=\"chart\" width=\"1200\" height=\"360\"></canvas></div>
 <script>
@@ -523,7 +523,7 @@ async function refresh(){
   el.innerHTML=labels.map(([k,t])=>`<div class=\"metric\"><div class=\"l\">${t}</div><div class=\"v\">${fmt(k,d.metrics[k]??0)}</div></div>`).join('');
   draw(d.series||[]);
 }
-setInterval(refresh,5000); refresh();
+setInterval(refresh,1000); refresh();
 </script></body></html>"""
 
 
@@ -556,9 +556,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--web", action="store_true", help="启动动态网页")
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=8081, help="默认8081，不用8000")
-    p.add_argument("--align-to-hour", action=argparse.BooleanOptionalAction, default=True, help="按整点偏移秒采集（默认开启）")
+    p.add_argument("--align-to-hour", action=argparse.BooleanOptionalAction, default=False, help="按整点偏移秒采集（默认关闭，建议高频时关闭）")
     p.add_argument("--sample-offset-seconds", type=int, default=60, help="每小时第N秒采集，默认60")
-    p.add_argument("--interval-seconds", type=int, default=3600, help="非整点模式时使用的固定间隔")
+    p.add_argument("--interval-seconds", type=float, default=1.0, help="非整点模式时使用的固定间隔，默认1秒")
     p.add_argument("--realized-window-hours", type=int, default=24)
     p.add_argument("--record-file", type=Path, default=Path("output/funding_records_stream.csv"))
     p.add_argument("--summary-csv", type=Path, default=Path("output/funding_summary_stream.csv"))
@@ -580,7 +580,7 @@ def run_web(args: argparse.Namespace) -> int:
 
     server = ThreadingHTTPServer((args.host, args.port), make_handler(service))
     print(f"[INFO] Web启动: http://{args.host}:{args.port}")
-    print("[INFO] 采样规则：每小时开始第60秒采集（UTC）")
+    print("[INFO] 采样规则：" + ("每小时开始第60秒采集（UTC）" if args.align_to_hour else f"固定间隔 {args.interval_seconds} 秒采集"))
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -599,7 +599,7 @@ def run_cli(args: argparse.Namespace) -> int:
         return 0
 
     print("[INFO] 持续采集中（Ctrl+C停止）")
-    print("[INFO] 采样规则：每小时开始第60秒采集（UTC）")
+    print("[INFO] 采样规则：" + ("每小时开始第60秒采集（UTC）" if args.align_to_hour else f"固定间隔 {args.interval_seconds} 秒采集"))
     service.background_loop(delay_first=False)
     return 0
 
