@@ -29,6 +29,8 @@ FUNDING_INFO_PATH = "/fapi/v1/fundingInfo"
 class FundingSnapshot:
     timestamp: dt.datetime
     realized_fee_window: float
+    realized_received_window: float
+    realized_paid_window: float
     realized_window_hours: float
     estimated_next_fee: float
     estimated_hourly_fee: float
@@ -103,11 +105,13 @@ class BinanceClient:
                     intervals[symbol] = hours
         return intervals
 
-    def get_funding_income_sum(self, start: dt.datetime, end: dt.datetime) -> float:
+    def get_funding_income_summary(self, start: dt.datetime, end: dt.datetime) -> tuple[float, float, float]:
         start_ms = int(start.timestamp() * 1000)
         end_ms = int(end.timestamp() * 1000)
         page_start = start_ms
-        total = 0.0
+        net_total = 0.0
+        received_total = 0.0
+        paid_total = 0.0
 
         while page_start < end_ms:
             data = self._signed_request(
@@ -129,14 +133,19 @@ class BinanceClient:
                     income_time = int(item.get("time", 0))
                 except (TypeError, ValueError):
                     continue
-                total += income
+
+                net_total += income
+                if income >= 0:
+                    received_total += income
+                else:
+                    paid_total += -income
                 last_time = max(last_time, income_time)
 
             if len(data) < 1000:
                 break
             page_start = last_time + 1
 
-        return total
+        return net_total, received_total, paid_total
 
 
 def parse_datetime(date_str: str) -> dt.datetime:
@@ -205,11 +214,16 @@ def collect_snapshot(client: BinanceClient, now: dt.datetime, realized_window_ho
     window_h = float(realized_window_hours)
     if window_h <= 0:
         window_h = 1.0
-    realized_fee_window = client.get_funding_income_sum(now - dt.timedelta(hours=window_h), now)
+    realized_fee_window, realized_received_window, realized_paid_window = client.get_funding_income_summary(
+        now - dt.timedelta(hours=window_h),
+        now,
+    )
 
     return FundingSnapshot(
         timestamp=now,
         realized_fee_window=realized_fee_window,
+        realized_received_window=realized_received_window,
+        realized_paid_window=realized_paid_window,
         realized_window_hours=window_h,
         estimated_next_fee=estimated_next_fee,
         estimated_hourly_fee=estimated_hourly_fee,
@@ -228,6 +242,8 @@ def save_record(snapshot: FundingSnapshot, csv_path: Path) -> None:
                 [
                     "timestamp_utc",
                     "realized_fee_window",
+                    "realized_received_window",
+                    "realized_paid_window",
                     "realized_window_hours",
                     "estimated_next_fee",
                     "estimated_hourly_fee",
@@ -239,6 +255,8 @@ def save_record(snapshot: FundingSnapshot, csv_path: Path) -> None:
             [
                 snapshot.timestamp.isoformat(),
                 f"{snapshot.realized_fee_window:.12f}",
+                f"{snapshot.realized_received_window:.12f}",
+                f"{snapshot.realized_paid_window:.12f}",
                 f"{snapshot.realized_window_hours:.12f}",
                 f"{snapshot.estimated_next_fee:.12f}",
                 f"{snapshot.estimated_hourly_fee:.12f}",
@@ -259,6 +277,8 @@ def load_records(csv_path: Path, start_time: dt.datetime | None) -> list[Funding
             try:
                 ts = parse_datetime(row["timestamp_utc"])
                 realized = float(row["realized_fee_window"])
+                received = float(row.get("realized_received_window", 0.0))
+                paid = float(row.get("realized_paid_window", 0.0))
                 window_h = float(row["realized_window_hours"])
                 est_next = float(row["estimated_next_fee"])
                 est_hourly = float(row["estimated_hourly_fee"])
@@ -274,6 +294,8 @@ def load_records(csv_path: Path, start_time: dt.datetime | None) -> list[Funding
                 FundingSnapshot(
                     timestamp=ts,
                     realized_fee_window=realized,
+                    realized_received_window=received,
+                    realized_paid_window=paid,
                     realized_window_hours=window_h,
                     estimated_next_fee=est_next,
                     estimated_hourly_fee=est_hourly,
@@ -289,10 +311,20 @@ def compute_metrics(records: list[FundingSnapshot]) -> dict[str, float]:
         return {
             "count": 0.0,
             "total_realized": 0.0,
+            "total_received": 0.0,
+            "total_paid": 0.0,
             "avg_hourly_realized": 0.0,
+            "avg_hourly_received": 0.0,
+            "avg_hourly_paid": 0.0,
             "daily_fee": 0.0,
             "monthly_fee": 0.0,
             "yearly_fee": 0.0,
+            "daily_received": 0.0,
+            "monthly_received": 0.0,
+            "yearly_received": 0.0,
+            "daily_paid": 0.0,
+            "monthly_paid": 0.0,
+            "yearly_paid": 0.0,
             "avg_weighted_rate_per_hour": 0.0,
             "daily_rate": 0.0,
             "monthly_rate": 0.0,
@@ -303,8 +335,12 @@ def compute_metrics(records: list[FundingSnapshot]) -> dict[str, float]:
     count = float(len(records))
 
     total_realized = sum(r.realized_fee_window for r in records)
+    total_received = sum(r.realized_received_window for r in records)
+    total_paid = sum(r.realized_paid_window for r in records)
     total_covered_hours = sum(r.realized_window_hours for r in records)
     avg_hourly_realized = total_realized / total_covered_hours if total_covered_hours > 0 else 0.0
+    avg_hourly_received = total_received / total_covered_hours if total_covered_hours > 0 else 0.0
+    avg_hourly_paid = total_paid / total_covered_hours if total_covered_hours > 0 else 0.0
 
     sum_notional = sum(r.total_abs_notional for r in records)
     if sum_notional > 0:
@@ -321,10 +357,20 @@ def compute_metrics(records: list[FundingSnapshot]) -> dict[str, float]:
     return {
         "count": count,
         "total_realized": total_realized,
+        "total_received": total_received,
+        "total_paid": total_paid,
         "avg_hourly_realized": avg_hourly_realized,
+        "avg_hourly_received": avg_hourly_received,
+        "avg_hourly_paid": avg_hourly_paid,
         "daily_fee": avg_hourly_realized * 24,
         "monthly_fee": avg_hourly_realized * 24 * 30,
         "yearly_fee": avg_hourly_realized * 24 * 365,
+        "daily_received": avg_hourly_received * 24,
+        "monthly_received": avg_hourly_received * 24 * 30,
+        "yearly_received": avg_hourly_received * 24 * 365,
+        "daily_paid": avg_hourly_paid * 24,
+        "monthly_paid": avg_hourly_paid * 24 * 30,
+        "yearly_paid": avg_hourly_paid * 24 * 365,
         "avg_weighted_rate_per_hour": avg_weighted_rate_per_hour,
         "daily_rate": avg_weighted_rate_per_hour * 24,
         "monthly_rate": avg_weighted_rate_per_hour * 24 * 30,
@@ -429,16 +475,20 @@ def build_charts(records: list[FundingSnapshot], metrics: dict[str, float], outp
 
     info_lines = [
         f"Samples: {int(metrics['count'])}",
-        f"Total realized: {metrics['total_realized']:.8f} USDT",
-        f"Avg hourly realized: {metrics['avg_hourly_realized']:.8f} USDT",
+        f"Total realized (net): {metrics['total_realized']:.8f} USDT",
+        f"Total received: {metrics['total_received']:.8f} USDT",
+        f"Total paid: {metrics['total_paid']:.8f} USDT",
+        f"Avg hourly realized (net): {metrics['avg_hourly_realized']:.8f} USDT",
+        f"Avg hourly received: {metrics['avg_hourly_received']:.8f} USDT",
+        f"Avg hourly paid: {metrics['avg_hourly_paid']:.8f} USDT",
         f"Avg hourly estimated: {metrics['avg_estimated_hourly_fee']:.8f} USDT",
-        f"Daily projection: {metrics['daily_fee']:.8f} USDT",
+        f"Daily net projection: {metrics['daily_fee']:.8f} USDT",
         f"Monthly projection: {metrics['monthly_fee']:.8f} USDT",
         f"Yearly projection: {metrics['yearly_fee']:.8f} USDT",
         f"Weighted avg hourly rate: {metrics['avg_weighted_rate_per_hour']*100:.6f}%",
     ]
     for idx, line in enumerate(info_lines):
-        y = 620 + idx * 28
+        y = 612 + idx * 22
         parts.append(
             f'<text x="790" y="{y}" font-size="16" font-family="Arial" fill="#222222">{_escape_xml(line)}</text>'
         )
@@ -475,12 +525,22 @@ def print_metrics(metrics: dict[str, float], start_date: dt.datetime | None) -> 
     if start_date:
         print(f"统计起始时间(UTC): {start_date.isoformat()}")
     print(f"样本数量: {int(metrics['count'])}")
-    print(f"总已实现资金费: {metrics['total_realized']:.8f} USDT")
-    print(f"平均每小时已实现资金费: {metrics['avg_hourly_realized']:.8f} USDT")
+    print(f"总已实现资金费(净): {metrics['total_realized']:.8f} USDT")
+    print(f"总收到资金费: {metrics['total_received']:.8f} USDT")
+    print(f"总支付资金费: {metrics['total_paid']:.8f} USDT")
+    print(f"平均每小时已实现资金费(净): {metrics['avg_hourly_realized']:.8f} USDT")
+    print(f"平均每小时收到资金费: {metrics['avg_hourly_received']:.8f} USDT")
+    print(f"平均每小时支付资金费: {metrics['avg_hourly_paid']:.8f} USDT")
     print(f"平均每小时估算资金费: {metrics['avg_estimated_hourly_fee']:.8f} USDT")
-    print(f"资金费投影(日化): {metrics['daily_fee']:.8f} USDT")
-    print(f"资金费投影(月化): {metrics['monthly_fee']:.8f} USDT")
-    print(f"资金费投影(年化): {metrics['yearly_fee']:.8f} USDT")
+    print(f"资金费投影(日化,净): {metrics['daily_fee']:.8f} USDT")
+    print(f"资金费投影(月化,净): {metrics['monthly_fee']:.8f} USDT")
+    print(f"资金费投影(年化,净): {metrics['yearly_fee']:.8f} USDT")
+    print(f"资金费投影(日化,收到): {metrics['daily_received']:.8f} USDT")
+    print(f"资金费投影(月化,收到): {metrics['monthly_received']:.8f} USDT")
+    print(f"资金费投影(年化,收到): {metrics['yearly_received']:.8f} USDT")
+    print(f"资金费投影(日化,支付): {metrics['daily_paid']:.8f} USDT")
+    print(f"资金费投影(月化,支付): {metrics['monthly_paid']:.8f} USDT")
+    print(f"资金费投影(年化,支付): {metrics['yearly_paid']:.8f} USDT")
     print("-" * 72)
     print(f"加权平均每小时费率: {metrics['avg_weighted_rate_per_hour']*100:.6f}%")
     print(f"费率日化: {metrics['daily_rate']*100:.6f}%")
@@ -553,10 +613,16 @@ def build_dashboard_html() -> str:
   <script>
     const labels = [
       ['count','样本数'],
-      ['total_realized','总已实现资金费(USDT)'],
-      ['avg_hourly_realized','平均每小时已实现(USDT)'],
+      ['total_realized','总已实现资金费(净USDT)'],
+      ['total_received','总收到资金费(USDT)'],
+      ['total_paid','总支付资金费(USDT)'],
+      ['avg_hourly_realized','平均每小时已实现(净USDT)'],
+      ['avg_hourly_received','平均每小时收到(USDT)'],
+      ['avg_hourly_paid','平均每小时支付(USDT)'],
       ['avg_estimated_hourly_fee','平均每小时估算(USDT)'],
-      ['daily_fee','资金费日化(USDT)'],
+      ['daily_fee','净资金费日化(USDT)'],
+      ['daily_received','收到资金费日化(USDT)'],
+      ['daily_paid','支付资金费日化(USDT)'],
       ['monthly_fee','资金费月化(USDT)'],
       ['yearly_fee','资金费年化(USDT)'],
       ['avg_weighted_rate_per_hour','加权每小时费率'],

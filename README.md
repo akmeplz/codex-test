@@ -5,6 +5,7 @@
 核心能力：
 
 - 读取 Binance USDⓈ-M 持仓（动态变化）。
+- 统计已实现资金费的三种口径：净值、收到(正收入)、支付(负支出)。
 - 读取每个持仓币对的资金费率并估算：
   - 下一次结算资金费（next fee）
   - 按结算周期折算后的每小时估算资金费（hourly normalized）
@@ -106,7 +107,7 @@ python binance_funding_monitor.py --web --port 8081
 
 ## 输出文件
 
-- `output/funding_records.csv`：小时记录
+- `output/funding_records.csv`：小时记录（含净值/收到/支付）
 - `output/funding_summary.csv`：汇总指标
 - `output/funding_summary.svg`：图表
 
