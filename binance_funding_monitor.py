@@ -375,7 +375,12 @@ class FundingService:
         return ex
 
     def poll_funding_event(self, ex: ExposureSnapshot) -> None:
-        since = self.last_income_time_ms + 1
+        now_ms = int(dt.datetime.now(dt.timezone.utc).timestamp() * 1000)
+        # Binance may reject future startTime with HTTP 400. Clamp to server-now window.
+        since = min(self.last_income_time_ms + 1, now_ms - 1)
+        if since <= 0:
+            return
+
         if self.demo_client:
             rows = self.demo_client.poll_new_funding(since)
         else:
@@ -425,6 +430,9 @@ class FundingService:
         while not self.stop_event.is_set():
             try:
                 self.run_tick()
+            except error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", errors="ignore") if hasattr(exc, "read") else ""
+                print(f"[WARN] tick failed: HTTP {exc.code} {detail}", file=sys.stderr)
             except Exception as exc:  # noqa: BLE001
                 print(f"[WARN] tick failed: {exc}", file=sys.stderr)
             self.stop_event.wait(self.args.interval_seconds)
