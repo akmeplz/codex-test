@@ -64,3 +64,10 @@ python binance_funding_monitor.py --web --demo-mode --port 8081
 - `--resume`（续写文件）
 - `--demo-mode`
 - `--once`
+
+
+---
+
+## 时间同步说明
+
+已内置 Binance 服务器时间自动同步。若出现 `-1021`（本地时间超前/滞后）会自动校时并重试一次请求。

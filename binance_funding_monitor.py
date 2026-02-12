@@ -28,6 +28,7 @@ POSITION_RISK_PATH = "/fapi/v2/positionRisk"
 INCOME_HISTORY_PATH = "/fapi/v1/income"
 FUNDING_INFO_PATH = "/fapi/v1/fundingInfo"
 ACCOUNT_INFO_PATH = "/fapi/v2/account"
+SERVER_TIME_PATH = "/fapi/v1/time"
 
 
 @dataclass
@@ -55,17 +56,40 @@ class BinanceClient:
         self.api_key = api_key
         self.api_secret = api_secret.encode("utf-8")
         self.recv_window = recv_window
+        self.time_offset_ms = 0
+
+    def _server_now_ms(self) -> int:
+        return int(dt.datetime.now(dt.timezone.utc).timestamp() * 1000) + self.time_offset_ms
+
+    def sync_server_time(self) -> None:
+        req = request.Request(url=f"{BASE_URL}{SERVER_TIME_PATH}", headers={"User-Agent": "funding-stream/6.0"})
+        with request.urlopen(req, timeout=15) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        server_ms = int(payload.get("serverTime", 0))
+        local_ms = int(dt.datetime.now(dt.timezone.utc).timestamp() * 1000)
+        if server_ms > 0:
+            self.time_offset_ms = server_ms - local_ms
 
     def _signed_request(self, path: str, params: dict[str, object]) -> object:
-        q = dict(params)
-        q["timestamp"] = int(dt.datetime.now(dt.timezone.utc).timestamp() * 1000)
-        q["recvWindow"] = self.recv_window
-        encoded = urllib.parse.urlencode(q, doseq=True)
-        sig = hmac.new(self.api_secret, encoded.encode("utf-8"), hashlib.sha256).hexdigest()
-        url = f"{BASE_URL}{path}?{encoded}&signature={sig}"
-        req = request.Request(url=url, headers={"X-MBX-APIKEY": self.api_key, "User-Agent": "funding-stream/6.0"})
-        with request.urlopen(req, timeout=30) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+        def _do_req() -> object:
+            q = dict(params)
+            q["timestamp"] = self._server_now_ms()
+            q["recvWindow"] = self.recv_window
+            encoded = urllib.parse.urlencode(q, doseq=True)
+            sig = hmac.new(self.api_secret, encoded.encode("utf-8"), hashlib.sha256).hexdigest()
+            url = f"{BASE_URL}{path}?{encoded}&signature={sig}"
+            req = request.Request(url=url, headers={"X-MBX-APIKEY": self.api_key, "User-Agent": "funding-stream/6.0"})
+            with request.urlopen(req, timeout=30) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+
+        try:
+            return _do_req()
+        except error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="ignore") if hasattr(exc, "read") else ""
+            if exc.code == 400 and '"code":-1021' in detail.replace(' ', ''):
+                self.sync_server_time()
+                return _do_req()
+            raise
 
     def _public_request(self, path: str) -> object:
         req = request.Request(url=f"{BASE_URL}{path}", headers={"User-Agent": "funding-stream/6.0"})
@@ -315,6 +339,10 @@ class FundingService:
         else:
             api_key, api_secret = resolve_api_credentials(args)
             self.client = BinanceClient(api_key, api_secret)
+            try:
+                self.client.sync_server_time()
+            except Exception:
+                pass
 
         now_ms = int(dt.datetime.now(dt.timezone.utc).timestamp() * 1000)
         self.last_income_time_ms = now_ms
