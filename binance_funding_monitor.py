@@ -291,6 +291,9 @@ class RunningStats:
                 "net_daily": 0.0,
                 "received_daily": 0.0,
                 "paid_daily": 0.0,
+                "pnl_rate_daily": 0.0,
+                "pnl_rate_monthly": 0.0,
+                "pnl_rate_yearly": 0.0,
                 "rate_daily": 0.0,
                 "rate_yearly": 0.0,
                 "avg_estimated_hourly_fee": 0.0,
@@ -300,6 +303,17 @@ class RunningStats:
         recv_h = self.received / self.total_hours
         paid_h = self.paid / self.total_hours
         rate_h = self.weighted_rate_nom / self.weighted_rate_den if self.weighted_rate_den > 0 else 0.0
+
+        net_daily = net_h * 24
+        received_daily = recv_h * 24
+        paid_daily = paid_h * 24
+
+        if self.current_position_value > 0:
+            pnl_rate_daily = net_daily / self.current_position_value
+        else:
+            pnl_rate_daily = 0.0
+        pnl_rate_monthly = pnl_rate_daily * 30
+        pnl_rate_yearly = pnl_rate_daily * 365
 
         return {
             "count": float(self.count),
@@ -312,9 +326,12 @@ class RunningStats:
             "net_hourly": net_h,
             "received_hourly": recv_h,
             "paid_hourly": paid_h,
-            "net_daily": net_h * 24,
-            "received_daily": recv_h * 24,
-            "paid_daily": paid_h * 24,
+            "net_daily": net_daily,
+            "received_daily": received_daily,
+            "paid_daily": paid_daily,
+            "pnl_rate_daily": pnl_rate_daily,
+            "pnl_rate_monthly": pnl_rate_monthly,
+            "pnl_rate_yearly": pnl_rate_yearly,
             "rate_daily": rate_h * 24,
             "rate_yearly": rate_h * 24 * 365,
             "avg_estimated_hourly_fee": self.estimated_hourly_sum / self.count,
@@ -475,11 +492,14 @@ const labels=[
 ['net_daily','净日化'],
 ['received_daily','收到日化'],
 ['paid_daily','支付日化'],
+['pnl_rate_daily','日化收益率(净日化/仓位价值)'],
+['pnl_rate_monthly','月化收益率'],
+['pnl_rate_yearly','年化收益率'],
 ['rate_daily','费率日化(%)'],
 ['rate_yearly','费率年化(%)']
 ];
 function fmt(k,v){
-  if(['rate_daily','rate_yearly'].includes(k)) return (v*100).toFixed(4)+'%';
+  if(['rate_daily','rate_yearly','pnl_rate_daily','pnl_rate_monthly','pnl_rate_yearly'].includes(k)) return (v*100).toFixed(4)+'%';
   if(k==='count') return String(Math.round(v));
   if(k==='actual_leverage') return Number(v).toFixed(4)+'x';
   return Number(v).toFixed(6);
