@@ -408,7 +408,10 @@ class FundingService:
             self.append_record(snap)
             self.write_summary(m)
 
-    def background_loop(self) -> None:
+    def background_loop(self, delay_first: bool = False) -> None:
+        if delay_first:
+            self.stop_event.wait(self.args.interval_seconds)
+
         while not self.stop_event.is_set():
             try:
                 self.run_once()
@@ -416,8 +419,8 @@ class FundingService:
                 print(f"[WARN] collect failed: {exc}", file=sys.stderr)
             self.stop_event.wait(self.args.interval_seconds)
 
-    def start_background(self) -> None:
-        t = threading.Thread(target=self.background_loop, daemon=True)
+    def start_background(self, delay_first: bool = False) -> None:
+        t = threading.Thread(target=self.background_loop, kwargs={"delay_first": delay_first}, daemon=True)
         t.start()
 
     def snapshot_payload(self) -> dict[str, Any]:
@@ -516,13 +519,14 @@ def parse_args() -> argparse.Namespace:
 
 def run_web(args: argparse.Namespace) -> int:
     service = FundingService(args)
-    service.start_background()
 
-    # 立即先采一次，避免页面空白
+    # 先采一次，页面启动即有1条样本；后台线程延迟一个采样周期再采，避免瞬间变成2条。
     try:
         service.run_once()
     except Exception as exc:  # noqa: BLE001
         print(f"[WARN] initial collect failed: {exc}", file=sys.stderr)
+
+    service.start_background(delay_first=True)
 
     handler = make_handler(service)
     server = ThreadingHTTPServer((args.host, args.port), handler)
