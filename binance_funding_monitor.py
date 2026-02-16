@@ -245,6 +245,17 @@ def compute_exposure(client: BinanceClient, now: dt.datetime) -> ExposureSnapsho
     )
 
 
+
+
+def parse_time_value(value: str) -> dt.datetime:
+    v = value.strip().replace(' ', 'T')
+    parsed = dt.datetime.fromisoformat(v)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    else:
+        parsed = parsed.astimezone(dt.timezone.utc)
+    return parsed
+
 class RunningStats:
     def __init__(self) -> None:
         self.count = 0
@@ -469,9 +480,139 @@ class FundingService:
         t = threading.Thread(target=self.background_loop, daemon=True)
         t.start()
 
-    def snapshot_payload(self) -> dict[str, Any]:
+    def _load_records_in_range(
+        self,
+        start: dt.datetime | None,
+        end: dt.datetime | None,
+    ) -> list[dict[str, float | str]]:
+        if not self.record_file.exists():
+            return []
+
+        rows: list[dict[str, float | str]] = []
+        with self.record_file.open("r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                try:
+                    ts = parse_time_value(str(row.get("timestamp_utc", "")))
+                    net = float(row.get("realized_net_event", 0.0))
+                    recv = float(row.get("realized_received_event", 0.0))
+                    paid = float(row.get("realized_paid_event", 0.0))
+                    hours = float(row.get("event_window_hours", 0.0))
+                    pos = float(row.get("position_value", 0.0))
+                    eq = float(row.get("account_equity", 0.0))
+                    lev = float(row.get("actual_leverage", 0.0))
+                except (TypeError, ValueError):
+                    continue
+
+                if start and ts < start:
+                    continue
+                if end and ts > end:
+                    continue
+
+                rows.append(
+                    {
+                        "timestamp": ts.isoformat(),
+                        "net": net,
+                        "recv": recv,
+                        "paid": paid,
+                        "hours": hours,
+                        "position_value": pos,
+                        "account_equity": eq,
+                        "actual_leverage": lev,
+                    }
+                )
+        return rows
+
+    def _metrics_from_records(self, rows: list[dict[str, float | str]]) -> tuple[dict[str, float], list[dict[str, str | float]]]:
         with self.lock:
-            return {"metrics": self.stats.metrics(), "series": list(self.series)}
+            base = self.stats.metrics()
+
+        if not rows:
+            # keep exposure realtime, funding interval data as zeroed
+            m = dict(base)
+            m.update(
+                {
+                    "count": 0.0,
+                    "net_total": 0.0,
+                    "received_total": 0.0,
+                    "paid_total": 0.0,
+                    "net_hourly": 0.0,
+                    "received_hourly": 0.0,
+                    "paid_hourly": 0.0,
+                    "net_daily": 0.0,
+                    "received_daily": 0.0,
+                    "paid_daily": 0.0,
+                    "pnl_rate_daily": 0.0,
+                    "pnl_rate_monthly": 0.0,
+                    "pnl_rate_yearly": 0.0,
+                }
+            )
+            return m, []
+
+        count = float(len(rows))
+        net_total = sum(float(r["net"]) for r in rows)
+        recv_total = sum(float(r["recv"]) for r in rows)
+        paid_total = sum(float(r["paid"]) for r in rows)
+        total_hours = sum(max(float(r["hours"]), 0.0) for r in rows)
+        if total_hours <= 0:
+            total_hours = max(count / 24.0, 1 / 3600)
+
+        net_h = net_total / total_hours
+        recv_h = recv_total / total_hours
+        paid_h = paid_total / total_hours
+        net_daily = net_h * 24
+        recv_daily = recv_h * 24
+        paid_daily = paid_h * 24
+
+        last = rows[-1]
+        position_value = float(last["position_value"])
+        account_equity = float(last["account_equity"])
+        actual_leverage = float(last["actual_leverage"])
+
+        pnl_daily = net_daily / position_value if position_value > 0 else 0.0
+
+        m = dict(base)
+        m.update(
+            {
+                "count": count,
+                "position_value": position_value,
+                "account_equity": account_equity,
+                "actual_leverage": actual_leverage,
+                "net_total": net_total,
+                "received_total": recv_total,
+                "paid_total": paid_total,
+                "net_hourly": net_h,
+                "received_hourly": recv_h,
+                "paid_hourly": paid_h,
+                "net_daily": net_daily,
+                "received_daily": recv_daily,
+                "paid_daily": paid_daily,
+                "pnl_rate_daily": pnl_daily,
+                "pnl_rate_monthly": pnl_daily * 30,
+                "pnl_rate_yearly": pnl_daily * 365,
+            }
+        )
+
+        series = [
+            {
+                "timestamp": str(r["timestamp"]),
+                "net_hourly": float(r["net"]) / max(float(r["hours"]), 1 / 3600),
+                "received_hourly": float(r["recv"]) / max(float(r["hours"]), 1 / 3600),
+                "paid_hourly": float(r["paid"]) / max(float(r["hours"]), 1 / 3600),
+            }
+            for r in rows
+        ]
+        return m, series
+
+    def snapshot_payload(self, start: dt.datetime | None = None, end: dt.datetime | None = None) -> dict[str, Any]:
+        if start is None and end is None:
+            with self.lock:
+                return {"metrics": self.stats.metrics(), "series": list(self.series)}
+
+        with self.lock:
+            rows = self._load_records_in_range(start, end)
+        metrics, series = self._metrics_from_records(rows)
+        return {"metrics": metrics, "series": series}
 
 
 def build_html() -> str:
@@ -532,11 +673,19 @@ function draw(series){
   g.fillStyle='#333'; g.fillText('蓝=净, 绿=收到, 红=支付（单位: USDT/h）',pad,20);
 }
 async function refresh(){
-  const r=await fetch('/api/live'); const d=await r.json();
+  const sp=new URLSearchParams();
+  const s=document.getElementById('start').value;
+  const e=document.getElementById('end').value;
+  if(s) sp.set('start', s);
+  if(e) sp.set('end', e);
+  const url='/api/live'+(sp.toString()?'?'+sp.toString():'');
+  const r=await fetch(url); const d=await r.json();
   const el=document.getElementById('metrics');
   el.innerHTML=labels.map(([k,t])=>`<div class=\"metric\"><div class=\"l\">${t}</div><div class=\"v\">${fmt(k,d.metrics[k]??0)}</div></div>`).join('');
   draw(d.series||[]);
 }
+document.getElementById('apply').addEventListener('click', refresh);
+document.getElementById('clear').addEventListener('click', ()=>{document.getElementById('start').value=''; document.getElementById('end').value=''; refresh();});
 setInterval(refresh,1000); refresh();
 </script></body></html>"""
 
@@ -556,7 +705,15 @@ def make_handler(service: FundingService):
                 self._send(200, build_html().encode("utf-8"), "text/html; charset=utf-8")
                 return
             if parsed.path == "/api/live":
-                self._send(200, json.dumps(service.snapshot_payload(), ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+                q = urllib.parse.parse_qs(parsed.query)
+                try:
+                    start = parse_time_value(q.get("start", [""])[0]) if q.get("start", [""])[0] else None
+                    end = parse_time_value(q.get("end", [""])[0]) if q.get("end", [""])[0] else None
+                except ValueError:
+                    self._send(400, b'{"error":"invalid datetime format"}', "application/json")
+                    return
+                payload = service.snapshot_payload(start=start, end=end)
+                self._send(200, json.dumps(payload, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
                 return
             self._send(404, b'{"error":"Not Found"}', "application/json")
 
@@ -569,7 +726,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--api-secret")
     p.add_argument("--web", action="store_true", help="启动动态网页")
     p.add_argument("--host", default="0.0.0.0")
-    p.add_argument("--port", type=int, default=8081, help="默认8081，不用8000")
+    p.add_argument("--port", type=int, default=8000, help="默认8000")
     p.add_argument("--interval-seconds", type=float, default=1.0, help="刷新仓位/权益/杠杆的轮询间隔，默认1秒")
     p.add_argument("--record-file", type=Path, default=Path("output/funding_records_stream.csv"))
     p.add_argument("--summary-csv", type=Path, default=Path("output/funding_summary_stream.csv"))

@@ -7,7 +7,7 @@
 
 所以不会再出现“每秒都涨样本数”的问题。
 
-默认端口：`8081`（不使用 8000）。
+默认端口：`8000`。
 
 ---
 
@@ -23,15 +23,15 @@ export BINANCE_API_SECRET="你的SECRET"
 ### 2) 启动网页版
 
 ```bash
-python binance_funding_monitor.py --web --port 8081
+python binance_funding_monitor.py --web --port 8000
 ```
 
-打开：`http://127.0.0.1:8081`
+打开：`http://127.0.0.1:8000`
 
 ### 3) 本地演示（无需 API）
 
 ```bash
-python binance_funding_monitor.py --web --demo-mode --port 8081
+python binance_funding_monitor.py --web --demo-mode --port 8000
 ```
 
 ---
@@ -56,7 +56,7 @@ python binance_funding_monitor.py --web --demo-mode --port 8081
 
 - `--web`
 - `--host 0.0.0.0`
-- `--port 8081`
+- `--port 8000`
 - `--interval-seconds 1`（仓位/权益/杠杆刷新间隔）
 - `--record-file output/funding_records_stream.csv`
 - `--summary-csv output/funding_summary_stream.csv`
@@ -71,3 +71,14 @@ python binance_funding_monitor.py --web --demo-mode --port 8081
 ## 时间同步说明
 
 已内置 Binance 服务器时间自动同步。若出现 `-1021`（本地时间超前/滞后）会自动校时并重试一次请求。
+
+
+---
+
+## 时间区间筛选
+
+网页支持手动选择 `开始时间` 和 `结束时间`（UTC）。
+
+- 选择区间后，资金费相关统计（样本数/净值/收到/支付/收益率）会按该区间重算。
+- 仓位价值、账户总权益、实际杠杆会显示区间内最后一条事件对应值。
+- 清空时间后恢复显示当前会话全量数据。
