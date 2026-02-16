@@ -630,7 +630,14 @@ canvas{width:100%;height:360px;border:1px solid #e5eaf3;border-radius:8px;backgr
 </style></head><body>
 <h2>Binance 资金费动态监控（仅增量，不回算历史）</h2>
 <div class=\"card\">每秒刷新仓位/权益/杠杆；仅当检测到新资金费入账时才新增样本。</div>
-<div class=\"card grid\" id=\"metrics\"></div>
+<div class="card">
+  <label>开始时间(UTC): <input id="start" type="datetime-local"></label>
+  <label style="margin-left:12px;">结束时间(UTC): <input id="end" type="datetime-local"></label>
+  <button id="apply" style="margin-left:12px;">应用时间区间</button>
+  <button id="clear" style="margin-left:8px;">清空</button>
+  <span id="errmsg" style="margin-left:12px;color:#b00020;"></span>
+</div>
+<div class="card grid" id="metrics"></div>
 <div class=\"card\"><canvas id=\"chart\" width=\"1200\" height=\"360\"></canvas></div>
 <script>
 const labels=[
@@ -673,19 +680,36 @@ function draw(series){
   g.fillStyle='#333'; g.fillText('蓝=净, 绿=收到, 红=支付（单位: USDT/h）',pad,20);
 }
 async function refresh(){
-  const sp=new URLSearchParams();
-  const s=document.getElementById('start').value;
-  const e=document.getElementById('end').value;
-  if(s) sp.set('start', s);
-  if(e) sp.set('end', e);
-  const url='/api/live'+(sp.toString()?'?'+sp.toString():'');
-  const r=await fetch(url); const d=await r.json();
-  const el=document.getElementById('metrics');
-  el.innerHTML=labels.map(([k,t])=>`<div class=\"metric\"><div class=\"l\">${t}</div><div class=\"v\">${fmt(k,d.metrics[k]??0)}</div></div>`).join('');
-  draw(d.series||[]);
+  const err=document.getElementById('errmsg');
+  if(err) err.textContent='';
+  try{
+    const sp=new URLSearchParams();
+    const sEl=document.getElementById('start');
+    const eEl=document.getElementById('end');
+    const sv=sEl ? sEl.value : '';
+    const ev=eEl ? eEl.value : '';
+    if(sv) sp.set('start', sv);
+    if(ev) sp.set('end', ev);
+    const url='/api/live'+(sp.toString()?'?'+sp.toString():'');
+    const r=await fetch(url);
+    const d=await r.json();
+    if(!r.ok) throw new Error(d.error || ('HTTP '+r.status));
+    const el=document.getElementById('metrics');
+    el.innerHTML=labels.map(([k,t])=>`<div class="metric"><div class="l">${t}</div><div class="v">${fmt(k,d.metrics[k]??0)}</div></div>`).join('');
+    draw(d.series||[]);
+  }catch(ex){
+    if(err) err.textContent=String(ex.message || ex);
+  }
 }
-document.getElementById('apply').addEventListener('click', refresh);
-document.getElementById('clear').addEventListener('click', ()=>{document.getElementById('start').value=''; document.getElementById('end').value=''; refresh();});
+const applyBtn=document.getElementById('apply');
+if(applyBtn) applyBtn.addEventListener('click', refresh);
+const clearBtn=document.getElementById('clear');
+if(clearBtn) clearBtn.addEventListener('click', ()=>{
+  const s=document.getElementById('start');
+  const e=document.getElementById('end');
+  if(s) s.value=''; if(e) e.value='';
+  refresh();
+});
 setInterval(refresh,1000); refresh();
 </script></body></html>"""
 
