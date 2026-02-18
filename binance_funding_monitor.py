@@ -11,6 +11,7 @@ import hmac
 import json
 import os
 import random
+import re
 import ssl
 import sys
 import threading
@@ -59,6 +60,10 @@ class BinanceClient:
         self.api_secret = api_secret.encode("utf-8")
         self.recv_window = recv_window
         self.time_offset_ms = 0
+        self._premium_cache_at = 0.0
+        self._premium_cache_data: dict[str, float] = {}
+        self._interval_cache_at = 0.0
+        self._interval_cache_data: dict[str, int] = {}
 
     def _load_json(self, req: request.Request, timeout: int = 30, retries: int = 2) -> object:
         last_exc: Exception | None = None
@@ -78,6 +83,21 @@ class BinanceClient:
 
     def _server_now_ms(self) -> int:
         return int(dt.datetime.now(dt.timezone.utc).timestamp() * 1000) + self.time_offset_ms
+
+    def _parse_retry_after(self, exc: error.HTTPError, detail: str) -> float:
+        header = exc.headers.get("Retry-After") if exc.headers else None
+        if header:
+            try:
+                return max(float(header), 0.0)
+            except ValueError:
+                pass
+        m = re.search(r'"retryAfter"\s*:\s*([0-9]+)', detail)
+        if m:
+            try:
+                return max(float(m.group(1)), 0.0)
+            except ValueError:
+                pass
+        return 0.0
 
     def sync_server_time(self) -> None:
         req = request.Request(url=f"{BASE_URL}{SERVER_TIME_PATH}", headers={"User-Agent": "funding-stream/6.0"})
@@ -127,6 +147,10 @@ class BinanceClient:
             return 0.0
 
     def get_premium_index(self) -> dict[str, float]:
+        now = time.time()
+        if (now - self._premium_cache_at) < 60 and self._premium_cache_data:
+            return dict(self._premium_cache_data)
+
         data = self._public_request(PREMIUM_INDEX_PATH)
         if isinstance(data, dict):
             data = [data]
@@ -139,9 +163,15 @@ class BinanceClient:
                 continue
             if s:
                 out[s] = r
+        self._premium_cache_at = now
+        self._premium_cache_data = dict(out)
         return out
 
     def get_funding_intervals(self) -> dict[str, int]:
+        now = time.time()
+        if (now - self._interval_cache_at) < 21600 and self._interval_cache_data:
+            return dict(self._interval_cache_data)
+
         data = self._public_request(FUNDING_INFO_PATH)
         out: dict[str, int] = {}
         if isinstance(data, list):
@@ -153,6 +183,8 @@ class BinanceClient:
                     continue
                 if s and h > 0:
                     out[s] = h
+        self._interval_cache_at = now
+        self._interval_cache_data = dict(out)
         return out
 
     def get_new_funding_incomes(self, since_ms: int) -> list[dict]:
@@ -446,6 +478,7 @@ class FundingService:
         self._last_funding_poll_at = 0.0
         self._rate_limit_backoff_s = 0.0
         self._cooldown_until = 0.0
+        self._last_rate_limit_error = ""
 
     def _init_record_file(self, reset: bool) -> None:
         mode = "w" if reset else "a"
@@ -617,6 +650,20 @@ class FundingService:
         ex = self.refresh_exposure(force=force)
         self.poll_funding_event(ex, force=force)
 
+    def _register_rate_limit(self, http_code: int, detail: str = "", retry_after_s: float = 0.0) -> None:
+        if http_code == 418:
+            base = 120.0
+            cap = 900.0
+        else:
+            base = 30.0
+            cap = 300.0
+        self._rate_limit_backoff_s = min(cap, max(base, self._rate_limit_backoff_s * 2 if self._rate_limit_backoff_s else base))
+        cooldown = max(self._rate_limit_backoff_s, retry_after_s)
+        self._cooldown_until = time.time() + cooldown
+        self._last_rate_limit_error = f"HTTP {http_code} cooldown {cooldown:.0f}s"
+        if detail:
+            self._last_rate_limit_error += f": {detail[:180]}"
+
     def background_loop(self) -> None:
         while not self.stop_event.is_set():
             now_ts = time.time()
@@ -628,10 +675,12 @@ class FundingService:
                 self._rate_limit_backoff_s = 0.0
             except error.HTTPError as exc:
                 detail = exc.read().decode("utf-8", errors="ignore") if hasattr(exc, "read") else ""
+                retry_after_s = 0.0
+                if self.client is not None:
+                    retry_after_s = self.client._parse_retry_after(exc, detail)
                 if exc.code in (418, 429):
-                    self._rate_limit_backoff_s = min(60.0, max(5.0, self._rate_limit_backoff_s * 2 or 5.0))
-                    self._cooldown_until = time.time() + self._rate_limit_backoff_s
-                    print(f"[WARN] rate limit hit HTTP {exc.code}, cooling down {self._rate_limit_backoff_s:.0f}s", file=sys.stderr)
+                    self._register_rate_limit(exc.code, detail=detail, retry_after_s=retry_after_s)
+                    print(f"[WARN] rate limit hit HTTP {exc.code}, strict cooldown active", file=sys.stderr)
                 else:
                     print(f"[WARN] tick failed: HTTP {exc.code} {detail}", file=sys.stderr)
             except IncompleteRead as exc:
@@ -838,6 +887,9 @@ class FundingService:
         key = (start_ms, end_ms)
         now = time.time()
         with self.lock:
+            if now < self._cooldown_until:
+                self._history_cache_error = self._last_rate_limit_error or "rate limited"
+                return []
             if self._history_cache_key == key and (now - self._history_cache_at) < 30:
                 return [dict(r) for r in self._history_cache_rows]
 
@@ -845,6 +897,15 @@ class FundingService:
             incomes = self.client.get_funding_incomes_between(start_ms=start_ms, end_ms=end_ms)
             rows = self._rows_from_income_events(incomes, start=start, end=end)
             err_msg = None
+        except error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="ignore") if hasattr(exc, "read") else ""
+            retry_after_s = self.client._parse_retry_after(exc, detail)
+            if exc.code in (418, 429):
+                self._register_rate_limit(exc.code, detail=detail, retry_after_s=retry_after_s)
+                err_msg = self._last_rate_limit_error
+            else:
+                err_msg = f"HTTP {exc.code}: {detail}"
+            rows = []
         except Exception as exc:  # noqa: BLE001
             rows = []
             err_msg = str(exc)
