@@ -630,10 +630,13 @@ class FundingService:
         recv_daily = recv_h * 24
         paid_daily = paid_h * 24
 
-        last = rows[-1]
-        position_value = float(last["position_value"])
-        account_equity = float(last["account_equity"])
-        actual_leverage = float(last["actual_leverage"])
+        weighted_pos = sum(max(float(r["hours"]), 1 / 3600) * float(r["position_value"]) for r in rows)
+        weighted_eq = sum(max(float(r["hours"]), 1 / 3600) * float(r["account_equity"]) for r in rows)
+        weighted_lev = sum(max(float(r["hours"]), 1 / 3600) * float(r["actual_leverage"]) for r in rows)
+
+        position_value = weighted_pos / total_hours if total_hours > 0 else 0.0
+        account_equity = weighted_eq / total_hours if total_hours > 0 else 0.0
+        actual_leverage = weighted_lev / total_hours if total_hours > 0 else 0.0
 
         pnl_daily = net_daily / position_value if position_value > 0 else 0.0
 
@@ -671,14 +674,25 @@ class FundingService:
         return m, series
 
     def snapshot_payload(self, start: dt.datetime | None = None, end: dt.datetime | None = None) -> dict[str, Any]:
-        if start is None and end is None:
+        rows = self._load_records_in_range(start, end)
+        if rows:
+            metrics, series = self._metrics_from_records(rows)
             with self.lock:
-                return {"metrics": self.stats.metrics(), "series": list(self.series)}
+                live = self.stats.metrics()
+            metrics.update(
+                {
+                    "position_value": live["position_value"],
+                    "account_equity": live["account_equity"],
+                    "actual_leverage": live["actual_leverage"],
+                    "rate_daily": live["rate_daily"],
+                    "rate_yearly": live["rate_yearly"],
+                    "avg_estimated_hourly_fee": live["avg_estimated_hourly_fee"],
+                }
+            )
+            return {"metrics": metrics, "series": series}
 
         with self.lock:
-            rows = self._load_records_in_range(start, end)
-        metrics, series = self._metrics_from_records(rows)
-        return {"metrics": metrics, "series": series}
+            return {"metrics": self.stats.metrics(), "series": list(self.series)}
 
 
 def build_html() -> str:
@@ -694,8 +708,8 @@ body{font-family:Arial,sans-serif;margin:20px;background:#f7f9fc;color:#222}
 .l{font-size:12px;color:#666}.v{font-size:19px;font-weight:600}
 canvas{width:100%;height:360px;border:1px solid #e5eaf3;border-radius:8px;background:#fff}
 </style></head><body>
-<h2>Binance 资金费动态监控（支持本地历史回溯）</h2>
-<div class=\"card\">每秒刷新仓位/权益/杠杆；仅当检测到新资金费入账时新增样本。可按时间区间回溯历史记录。</div>
+<h2>Binance 资金费动态监控（支持历史回算）</h2>
+<div class=\"card\">默认基于本地历史记录回算统计；每秒刷新仓位/权益/杠杆；仅当检测到新资金费入账时新增样本。</div>
 <div class="card">
   <label>开始时间(UTC): <input id="start" type="datetime-local"></label>
   <label style="margin-left:12px;">结束时间(UTC): <input id="end" type="datetime-local"></label>
@@ -834,7 +848,7 @@ def run_web(args: argparse.Namespace) -> int:
 
     server = ThreadingHTTPServer((args.host, args.port), make_handler(service))
     print(f"[INFO] Web启动: http://{args.host}:{args.port}")
-    print("[INFO] 每秒更新仓位/权益/杠杆；仅新资金费事件会增加样本（支持历史回溯）")
+    print("[INFO] 每秒更新仓位/权益/杠杆；仅新资金费事件会增加样本（默认历史回算）")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -853,7 +867,7 @@ def run_cli(args: argparse.Namespace) -> int:
         return 0
 
     print("[INFO] 持续运行中（Ctrl+C停止）")
-    print("[INFO] 每秒更新仓位/权益/杠杆；仅新资金费事件会增加样本（支持历史回溯）")
+    print("[INFO] 每秒更新仓位/权益/杠杆；仅新资金费事件会增加样本（默认历史回算）")
     try:
         service.background_loop()
     except KeyboardInterrupt:
