@@ -467,7 +467,8 @@ class FundingService:
 
         now = dt.datetime.now(dt.timezone.utc)
         now_ms = int(now.timestamp() * 1000)
-        self.last_income_time_ms = now_ms
+        history_last_ms = int(history_last_time.timestamp() * 1000) if history_last_time else now_ms
+        self.last_income_time_ms = history_last_ms
         self.last_funding_sample_time = history_last_time or now
         self._history_cache_rows: list[dict[str, float | str]] = []
         self._history_cache_key: tuple[int | None, int | None] | None = None
@@ -620,7 +621,7 @@ class FundingService:
         paid = sum(-r["income"] for r in rows if r["income"] < 0)
 
         now = dt.datetime.now(dt.timezone.utc)
-        elapsed_h = max((now - self.last_funding_sample_time).total_seconds() / 3600.0, 1 / 3600)
+        elapsed_h = max((latest_time - self.last_income_time_ms) / 3_600_000.0, self.args.min_event_window_hours)
 
         ev = FundingEventSnapshot(
             timestamp=now,
@@ -766,9 +767,9 @@ class FundingService:
         net_total = sum(float(r["net"]) for r in rows)
         recv_total = sum(float(r["recv"]) for r in rows)
         paid_total = sum(float(r["paid"]) for r in rows)
-        total_hours = sum(max(float(r["hours"]), 0.0) for r in rows)
+        total_hours = sum(max(float(r["hours"]), self.args.min_event_window_hours) for r in rows)
         if total_hours <= 0:
-            total_hours = max(count / 24.0, 1 / 3600)
+            total_hours = max(count / 24.0, self.args.min_event_window_hours)
 
         net_h = net_total / total_hours
         recv_h = recv_total / total_hours
@@ -777,9 +778,9 @@ class FundingService:
         recv_daily = recv_h * 24
         paid_daily = paid_h * 24
 
-        weighted_pos = sum(max(float(r["hours"]), 1 / 3600) * float(r["position_value"]) for r in rows)
-        weighted_eq = sum(max(float(r["hours"]), 1 / 3600) * float(r["account_equity"]) for r in rows)
-        weighted_lev = sum(max(float(r["hours"]), 1 / 3600) * float(r["actual_leverage"]) for r in rows)
+        weighted_pos = sum(max(float(r["hours"]), self.args.min_event_window_hours) * float(r["position_value"]) for r in rows)
+        weighted_eq = sum(max(float(r["hours"]), self.args.min_event_window_hours) * float(r["account_equity"]) for r in rows)
+        weighted_lev = sum(max(float(r["hours"]), self.args.min_event_window_hours) * float(r["actual_leverage"]) for r in rows)
 
         position_value = weighted_pos / total_hours if total_hours > 0 else 0.0
         account_equity = weighted_eq / total_hours if total_hours > 0 else 0.0
@@ -812,9 +813,9 @@ class FundingService:
         series = [
             {
                 "timestamp": str(r["timestamp"]),
-                "net_hourly": float(r["net"]) / max(float(r["hours"]), 1 / 3600),
-                "received_hourly": float(r["recv"]) / max(float(r["hours"]), 1 / 3600),
-                "paid_hourly": float(r["paid"]) / max(float(r["hours"]), 1 / 3600),
+                "net_hourly": float(r["net"]) / max(float(r["hours"]), self.args.min_event_window_hours),
+                "received_hourly": float(r["recv"]) / max(float(r["hours"]), self.args.min_event_window_hours),
+                "paid_hourly": float(r["paid"]) / max(float(r["hours"]), self.args.min_event_window_hours),
             }
             for r in rows
         ]
@@ -1095,6 +1096,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--interval-seconds", type=float, default=1.0, help="后台循环tick间隔，默认1秒")
     p.add_argument("--exposure-poll-seconds", type=float, default=5.0, help="仓位/权益/杠杆真实API拉取间隔，默认5秒")
     p.add_argument("--funding-poll-seconds", type=float, default=15.0, help="资金费事件轮询间隔，默认15秒")
+    p.add_argument("--min-event-window-hours", type=float, default=1.0, help="资金费事件换算的最小窗口小时，默认1小时")
     p.add_argument("--record-file", type=Path, default=Path("output/funding_records_stream.csv"))
     p.add_argument("--summary-csv", type=Path, default=Path("output/funding_summary_stream.csv"))
     p.add_argument("--chart-points", type=int, default=120)
