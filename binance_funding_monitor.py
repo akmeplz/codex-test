@@ -43,6 +43,7 @@ class ExposureSnapshot:
     estimated_next_fee: float
     estimated_hourly_fee: float
     weighted_rate_per_hour: float
+    expected_event_window_hours: float
 
 
 @dataclass
@@ -283,6 +284,7 @@ class DemoClient:
             estimated_next_fee=random.uniform(-20, 20),
             estimated_hourly_fee=random.uniform(-3, 3),
             weighted_rate_per_hour=rate_h,
+            expected_event_window_hours=random.choice([1.0, 4.0, 8.0]),
         )
 
     def poll_new_funding(self, since_ms: int) -> list[dict]:
@@ -312,6 +314,7 @@ def compute_exposure(client: BinanceClient, now: dt.datetime) -> ExposureSnapsho
     weighted_rate_nom = 0.0
     estimated_next_fee = 0.0
     estimated_hourly_fee = 0.0
+    weighted_interval_nom = 0.0
 
     for p in positions:
         try:
@@ -338,8 +341,10 @@ def compute_exposure(client: BinanceClient, now: dt.datetime) -> ExposureSnapsho
         estimated_next_fee += notional * rate
         estimated_hourly_fee += (notional * rate) / interval_h
         weighted_rate_nom += (rate / interval_h) * abs_notional
+        weighted_interval_nom += interval_h * abs_notional
 
     weighted_rate_h = weighted_rate_nom / position_value if position_value > 0 else 0.0
+    expected_window_h = weighted_interval_nom / position_value if position_value > 0 else 8.0
     leverage = position_value / equity if equity > 0 else 0.0
 
     return ExposureSnapshot(
@@ -350,6 +355,7 @@ def compute_exposure(client: BinanceClient, now: dt.datetime) -> ExposureSnapsho
         estimated_next_fee=estimated_next_fee,
         estimated_hourly_fee=estimated_hourly_fee,
         weighted_rate_per_hour=weighted_rate_h,
+        expected_event_window_hours=expected_window_h,
     )
 
 
@@ -378,11 +384,13 @@ class RunningStats:
         self.position_value = 0.0
         self.account_equity = 0.0
         self.actual_leverage = 0.0
+        self.expected_event_window_hours = 8.0
 
     def update_exposure(self, ex: ExposureSnapshot) -> None:
         self.position_value = ex.position_value
         self.account_equity = ex.account_equity
         self.actual_leverage = ex.actual_leverage
+        self.expected_event_window_hours = ex.expected_event_window_hours
         self.estimated_hourly_sum += ex.estimated_hourly_fee
         self.rate_weighted_nom += ex.weighted_rate_per_hour * ex.position_value
         self.rate_weighted_den += ex.position_value
@@ -580,6 +588,7 @@ class FundingService:
                     estimated_next_fee=0.0,
                     estimated_hourly_fee=0.0,
                     weighted_rate_per_hour=0.0,
+                    expected_event_window_hours=max(self.stats.expected_event_window_hours, self.args.min_event_window_hours),
                 )
 
         if self.demo_client:
@@ -621,7 +630,8 @@ class FundingService:
         paid = sum(-r["income"] for r in rows if r["income"] < 0)
 
         now = dt.datetime.now(dt.timezone.utc)
-        elapsed_h = max((latest_time - self.last_income_time_ms) / 3_600_000.0, self.args.min_event_window_hours)
+        floor_h = max(self.args.min_event_window_hours, ex.expected_event_window_hours)
+        elapsed_h = max((latest_time - self.last_income_time_ms) / 3_600_000.0, floor_h)
 
         ev = FundingEventSnapshot(
             timestamp=now,
@@ -1096,7 +1106,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--interval-seconds", type=float, default=1.0, help="后台循环tick间隔，默认1秒")
     p.add_argument("--exposure-poll-seconds", type=float, default=5.0, help="仓位/权益/杠杆真实API拉取间隔，默认5秒")
     p.add_argument("--funding-poll-seconds", type=float, default=15.0, help="资金费事件轮询间隔，默认15秒")
-    p.add_argument("--min-event-window-hours", type=float, default=1.0, help="资金费事件换算的最小窗口小时，默认1小时")
+    p.add_argument("--min-event-window-hours", type=float, default=8.0, help="资金费事件换算的最小窗口小时，默认8小时")
     p.add_argument("--record-file", type=Path, default=Path("output/funding_records_stream.csv"))
     p.add_argument("--summary-csv", type=Path, default=Path("output/funding_summary_stream.csv"))
     p.add_argument("--chart-points", type=int, default=120)
