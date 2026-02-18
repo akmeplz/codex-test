@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Binance funding monitor: increment samples only on new funding events, refresh exposure every second."""
+"""Binance funding monitor with event-driven sampling and local historical backtracking."""
 
 from __future__ import annotations
 
@@ -338,10 +338,12 @@ class FundingService:
         self.record_file.parent.mkdir(parents=True, exist_ok=True)
         self.summary_csv.parent.mkdir(parents=True, exist_ok=True)
 
-        if not args.resume:
+        if args.reset_records:
             self._init_record_file(reset=True)
-        elif not self.record_file.exists():
+        elif (not self.record_file.exists()) or self.record_file.stat().st_size == 0:
             self._init_record_file(reset=True)
+
+        history_last_time = self._bootstrap_from_records()
 
         self.client: BinanceClient | None = None
         self.demo_client: DemoClient | None = None
@@ -355,9 +357,10 @@ class FundingService:
             except Exception:
                 pass
 
-        now_ms = int(dt.datetime.now(dt.timezone.utc).timestamp() * 1000)
+        now = dt.datetime.now(dt.timezone.utc)
+        now_ms = int(now.timestamp() * 1000)
         self.last_income_time_ms = now_ms
-        self.last_funding_sample_time = dt.datetime.now(dt.timezone.utc)
+        self.last_funding_sample_time = history_last_time or now
 
     def _init_record_file(self, reset: bool) -> None:
         mode = "w" if reset else "a"
@@ -376,6 +379,51 @@ class FundingService:
                         "actual_leverage",
                     ]
                 )
+
+    def _bootstrap_from_records(self) -> dt.datetime | None:
+        if not self.record_file.exists():
+            return None
+
+        last_ts: dt.datetime | None = None
+        with self.record_file.open("r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                try:
+                    ts = parse_time_value(str(row.get("timestamp_utc", "")))
+                    net = float(row.get("realized_net_event", 0.0))
+                    recv = float(row.get("realized_received_event", 0.0))
+                    paid = float(row.get("realized_paid_event", 0.0))
+                    hours = max(float(row.get("event_window_hours", 0.0)), 1 / 3600)
+                    pos = float(row.get("position_value", 0.0))
+                    eq = float(row.get("account_equity", 0.0))
+                    lev = float(row.get("actual_leverage", 0.0))
+                except (TypeError, ValueError):
+                    continue
+
+                self.stats.update_funding_event(
+                    FundingEventSnapshot(
+                        timestamp=ts,
+                        realized_net=net,
+                        realized_received=recv,
+                        realized_paid=paid,
+                        event_window_hours=hours,
+                    )
+                )
+                self.series.append(
+                    {
+                        "timestamp": ts.isoformat(),
+                        "net_hourly": net / hours,
+                        "received_hourly": recv / hours,
+                        "paid_hourly": paid / hours,
+                    }
+                )
+
+                self.stats.position_value = pos
+                self.stats.account_equity = eq
+                self.stats.actual_leverage = lev
+                last_ts = ts
+
+        return last_ts
 
     def write_summary(self, m: dict[str, float]) -> None:
         with self.summary_csv.open("w", newline="", encoding="utf-8") as f:
@@ -628,8 +676,8 @@ body{font-family:Arial,sans-serif;margin:20px;background:#f7f9fc;color:#222}
 .l{font-size:12px;color:#666}.v{font-size:19px;font-weight:600}
 canvas{width:100%;height:360px;border:1px solid #e5eaf3;border-radius:8px;background:#fff}
 </style></head><body>
-<h2>Binance 资金费动态监控（仅增量，不回算历史）</h2>
-<div class=\"card\">每秒刷新仓位/权益/杠杆；仅当检测到新资金费入账时才新增样本。</div>
+<h2>Binance 资金费动态监控（支持本地历史回溯）</h2>
+<div class=\"card\">每秒刷新仓位/权益/杠杆；仅当检测到新资金费入账时新增样本。可按时间区间回溯历史记录。</div>
 <div class="card">
   <label>开始时间(UTC): <input id="start" type="datetime-local"></label>
   <label style="margin-left:12px;">结束时间(UTC): <input id="end" type="datetime-local"></label>
@@ -755,7 +803,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--record-file", type=Path, default=Path("output/funding_records_stream.csv"))
     p.add_argument("--summary-csv", type=Path, default=Path("output/funding_summary_stream.csv"))
     p.add_argument("--chart-points", type=int, default=120)
-    p.add_argument("--resume", action="store_true")
+    p.add_argument("--reset-records", action="store_true", help="启动时清空本地记录；默认保留并可回溯")
     p.add_argument("--demo-mode", action="store_true")
     p.add_argument("--once", action="store_true", help="仅刷新一次仓位并检测一次资金费事件")
     return p.parse_args()
@@ -768,7 +816,7 @@ def run_web(args: argparse.Namespace) -> int:
 
     server = ThreadingHTTPServer((args.host, args.port), make_handler(service))
     print(f"[INFO] Web启动: http://{args.host}:{args.port}")
-    print("[INFO] 每秒更新仓位/权益/杠杆；仅新资金费事件会增加样本")
+    print("[INFO] 每秒更新仓位/权益/杠杆；仅新资金费事件会增加样本（支持历史回溯）")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -787,7 +835,7 @@ def run_cli(args: argparse.Namespace) -> int:
         return 0
 
     print("[INFO] 持续运行中（Ctrl+C停止）")
-    print("[INFO] 每秒更新仓位/权益/杠杆；仅新资金费事件会增加样本")
+    print("[INFO] 每秒更新仓位/权益/杠杆；仅新资金费事件会增加样本（支持历史回溯）")
     try:
         service.background_loop()
     except KeyboardInterrupt:

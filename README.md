@@ -1,11 +1,11 @@
-# Binance 资金费监控（仅增量、动态图表）
+# Binance 资金费监控（增量采集 + 历史回溯）
 
-你这个需求我已经按“事件驱动”改了：
+当前版本是“事件驱动采集 + 本地历史回溯”：
 
 - 每秒更新：**仓位价值 / 账户总权益 / 实际杠杆**
 - 仅当出现新的 `FUNDING_FEE` 入账时：**样本数 +1**，并新增资金费样本点
 
-所以不会再出现“每秒都涨样本数”的问题。
+并且默认会保留历史记录文件，网页可按时间区间回溯之前的数据。
 
 默认端口：`8000`。
 
@@ -40,6 +40,7 @@ python binance_funding_monitor.py --web --demo-mode --port 8000
 
 - 仓位价值、账户权益、实际杠杆：按 `--interval-seconds` 轮询更新（默认 1 秒）。
 - 样本数（count）：仅在检测到新的 Binance 资金费事件时增加。
+- 历史回溯：默认保留 `record-file` 历史，重启后会自动加载到统计与图表，可直接按区间查询历史。
 - 图表：只画资金费事件样本（净/收到/支付），没有新资金费时曲线不新增点。
 
 ---
@@ -61,7 +62,7 @@ python binance_funding_monitor.py --web --demo-mode --port 8000
 - `--record-file output/funding_records_stream.csv`
 - `--summary-csv output/funding_summary_stream.csv`
 - `--chart-points 120`
-- `--resume`（续写文件）
+- `--reset-records`（启动时清空历史记录；默认不清空）
 - `--demo-mode`
 - `--once`
 
