@@ -43,6 +43,7 @@ python binance_funding_monitor.py --web --demo-mode --port 8000
 - 历史回算：API 默认读取本地 `record-file` 全量历史；若本地为空且给了开始时间，会自动请求 Binance `income` 历史来回算。
 - 图表：展示回算区间内每条资金费事件样本（净/收到/支付）。
 - 回算建议：为了避免每秒重复拉取历史，区间查询结果会做短时缓存（约30秒）。
+- 若 Binance 历史接口异常，前端会显示 warning，且 `source` 会提示当前是否来自 local/binance。
 
 ---
 

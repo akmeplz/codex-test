@@ -11,6 +11,7 @@ import hmac
 import json
 import os
 import random
+import ssl
 import sys
 import threading
 import time
@@ -66,11 +67,11 @@ class BinanceClient:
                 with request.urlopen(req, timeout=timeout) as resp:
                     payload = resp.read()
                 return json.loads(payload.decode("utf-8"))
-            except (IncompleteRead, json.JSONDecodeError) as exc:
+            except (IncompleteRead, json.JSONDecodeError, error.URLError, ssl.SSLError) as exc:
                 last_exc = exc
                 if attempt >= retries:
                     raise
-                time.sleep(0.2 * (attempt + 1))
+                time.sleep(0.25 * (attempt + 1))
         if last_exc is not None:
             raise last_exc
         raise RuntimeError("unexpected json load failure")
@@ -181,14 +182,14 @@ class BinanceClient:
             return []
 
         rows: list[dict] = []
-        cursor = start_ms
-        while cursor <= end_bound:
+        cursor_end = end_bound
+        while cursor_end >= start_ms:
             data = self._signed_request(
                 INCOME_HISTORY_PATH,
                 {
                     "incomeType": "FUNDING_FEE",
-                    "startTime": cursor,
-                    "endTime": end_bound,
+                    "startTime": start_ms,
+                    "endTime": cursor_end,
                     "limit": limit,
                 },
             )
@@ -202,7 +203,7 @@ class BinanceClient:
                     t = int(row.get("time", 0))
                 except (TypeError, ValueError):
                     continue
-                if t < start_ms or t > end_bound:
+                if t < start_ms or t > cursor_end:
                     continue
                 batch.append({"income": income, "time": t})
 
@@ -212,11 +213,13 @@ class BinanceClient:
             batch.sort(key=lambda x: x["time"])
             rows.extend(batch)
 
-            last_t = batch[-1]["time"]
-            next_cursor = last_t + 1
-            if len(batch) < limit or next_cursor <= cursor:
+            oldest_t = batch[0]["time"]
+            if len(batch) < limit or oldest_t <= start_ms:
                 break
-            cursor = next_cursor
+            next_cursor_end = oldest_t - 1
+            if next_cursor_end >= cursor_end:
+                break
+            cursor_end = next_cursor_end
 
         rows.sort(key=lambda x: x["time"])
         deduped: list[dict] = []
@@ -437,6 +440,7 @@ class FundingService:
         self._history_cache_rows: list[dict[str, float | str]] = []
         self._history_cache_key: tuple[int | None, int | None] | None = None
         self._history_cache_at = 0.0
+        self._history_cache_error: str | None = None
 
     def _init_record_file(self, reset: bool) -> None:
         mode = "w" if reset else "a"
@@ -803,20 +807,29 @@ class FundingService:
             if self._history_cache_key == key and (now - self._history_cache_at) < 30:
                 return [dict(r) for r in self._history_cache_rows]
 
-        incomes = self.client.get_funding_incomes_between(start_ms=start_ms, end_ms=end_ms)
-        rows = self._rows_from_income_events(incomes, start=start, end=end)
+        try:
+            incomes = self.client.get_funding_incomes_between(start_ms=start_ms, end_ms=end_ms)
+            rows = self._rows_from_income_events(incomes, start=start, end=end)
+            err_msg = None
+        except Exception as exc:  # noqa: BLE001
+            rows = []
+            err_msg = str(exc)
 
         with self.lock:
             self._history_cache_key = key
             self._history_cache_at = now
             self._history_cache_rows = [dict(r) for r in rows]
+            self._history_cache_error = err_msg
 
         return rows
 
+
     def snapshot_payload(self, start: dt.datetime | None = None, end: dt.datetime | None = None) -> dict[str, Any]:
         rows = self._load_records_in_range(start, end)
+        source = "local"
         if not rows:
             rows = self._load_binance_rows_in_range(start, end)
+            source = "binance" if rows else "none"
 
         if rows:
             metrics, series = self._metrics_from_records(rows)
@@ -832,10 +845,13 @@ class FundingService:
                     "avg_estimated_hourly_fee": live["avg_estimated_hourly_fee"],
                 }
             )
-            return {"metrics": metrics, "series": series}
+            return {"metrics": metrics, "series": series, "source": source}
 
         with self.lock:
-            return {"metrics": self.stats.metrics(), "series": list(self.series)}
+            payload = {"metrics": self.stats.metrics(), "series": list(self.series), "source": source}
+            if self._history_cache_error and start is not None:
+                payload["warning"] = f"binance history query failed: {self._history_cache_error}"
+            return payload
 
 
 def build_html() -> str:
@@ -858,7 +874,7 @@ canvas{width:100%;height:360px;border:1px solid #e5eaf3;border-radius:8px;backgr
   <label style="margin-left:12px;">结束时间(UTC): <input id="end" type="datetime-local"></label>
   <button id="apply" style="margin-left:12px;">应用时间区间</button>
   <button id="clear" style="margin-left:8px;">清空</button>
-  <span id="errmsg" style="margin-left:12px;color:#b00020;"></span>
+  <span id="errmsg" style="margin-left:12px;color:#b00020;"></span><span id="source" style="margin-left:12px;color:#555;"></span>
 </div>
 <div class="card grid" id="metrics"></div>
 <div class=\"card\"><canvas id=\"chart\" width=\"1200\" height=\"360\"></canvas></div>
@@ -904,7 +920,9 @@ function draw(series){
 }
 async function refresh(){
   const err=document.getElementById('errmsg');
+  const src=document.getElementById('source');
   if(err) err.textContent='';
+  if(src) src.textContent='';
   try{
     const sp=new URLSearchParams();
     const sEl=document.getElementById('start');
@@ -919,6 +937,8 @@ async function refresh(){
     if(!r.ok) throw new Error(d.error || ('HTTP '+r.status));
     const el=document.getElementById('metrics');
     el.innerHTML=labels.map(([k,t])=>`<div class="metric"><div class="l">${t}</div><div class="v">${fmt(k,d.metrics[k]??0)}</div></div>`).join('');
+    if(src && d.source) src.textContent='数据来源: '+d.source;
+    if(err && d.warning) err.textContent=String(d.warning);
     draw(d.series||[]);
   }catch(ex){
     if(err) err.textContent=String(ex.message || ex);
