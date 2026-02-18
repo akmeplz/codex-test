@@ -442,6 +442,11 @@ class FundingService:
         self._history_cache_at = 0.0
         self._history_cache_error: str | None = None
 
+        self._last_exposure_at = 0.0
+        self._last_funding_poll_at = 0.0
+        self._rate_limit_backoff_s = 0.0
+        self._cooldown_until = 0.0
+
     def _init_record_file(self, reset: bool) -> None:
         mode = "w" if reset else "a"
         with self.record_file.open(mode, newline="", encoding="utf-8") as f:
@@ -528,8 +533,21 @@ class FundingService:
                 ]
             )
 
-    def refresh_exposure(self) -> ExposureSnapshot:
+    def refresh_exposure(self, force: bool = False) -> ExposureSnapshot:
+        now_ts = time.time()
         now = dt.datetime.now(dt.timezone.utc)
+        with self.lock:
+            if (not force) and (now_ts - self._last_exposure_at) < self.args.exposure_poll_seconds:
+                return ExposureSnapshot(
+                    timestamp=now,
+                    position_value=self.stats.position_value,
+                    account_equity=self.stats.account_equity,
+                    actual_leverage=self.stats.actual_leverage,
+                    estimated_next_fee=0.0,
+                    estimated_hourly_fee=0.0,
+                    weighted_rate_per_hour=0.0,
+                )
+
         if self.demo_client:
             ex = self.demo_client.collect_exposure(now)
         else:
@@ -538,10 +556,16 @@ class FundingService:
 
         with self.lock:
             self.stats.update_exposure(ex)
+            self._last_exposure_at = now_ts
             self.write_summary(self.stats.metrics())
         return ex
 
-    def poll_funding_event(self, ex: ExposureSnapshot) -> None:
+    def poll_funding_event(self, ex: ExposureSnapshot, force: bool = False) -> None:
+        now_ts = time.time()
+        if (not force) and (now_ts - self._last_funding_poll_at) < self.args.funding_poll_seconds:
+            return
+        self._last_funding_poll_at = now_ts
+
         now_ms = int(dt.datetime.now(dt.timezone.utc).timestamp() * 1000)
         # Binance may reject future startTime with HTTP 400. Clamp to server-now window.
         since = min(self.last_income_time_ms + 1, now_ms - 1)
@@ -589,17 +613,27 @@ class FundingService:
         self.last_income_time_ms = latest_time
         self.last_funding_sample_time = now
 
-    def run_tick(self) -> None:
-        ex = self.refresh_exposure()
-        self.poll_funding_event(ex)
+    def run_tick(self, force: bool = False) -> None:
+        ex = self.refresh_exposure(force=force)
+        self.poll_funding_event(ex, force=force)
 
     def background_loop(self) -> None:
         while not self.stop_event.is_set():
+            now_ts = time.time()
+            if now_ts < self._cooldown_until:
+                self.stop_event.wait(min(self.args.interval_seconds, self._cooldown_until - now_ts))
+                continue
             try:
                 self.run_tick()
+                self._rate_limit_backoff_s = 0.0
             except error.HTTPError as exc:
                 detail = exc.read().decode("utf-8", errors="ignore") if hasattr(exc, "read") else ""
-                print(f"[WARN] tick failed: HTTP {exc.code} {detail}", file=sys.stderr)
+                if exc.code in (418, 429):
+                    self._rate_limit_backoff_s = min(60.0, max(5.0, self._rate_limit_backoff_s * 2 or 5.0))
+                    self._cooldown_until = time.time() + self._rate_limit_backoff_s
+                    print(f"[WARN] rate limit hit HTTP {exc.code}, cooling down {self._rate_limit_backoff_s:.0f}s", file=sys.stderr)
+                else:
+                    print(f"[WARN] tick failed: HTTP {exc.code} {detail}", file=sys.stderr)
             except IncompleteRead as exc:
                 print(f"[WARN] tick failed: incomplete read ({exc})", file=sys.stderr)
             except Exception as exc:  # noqa: BLE001
@@ -997,7 +1031,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--web", action="store_true", help="启动动态网页")
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=8000, help="默认8000")
-    p.add_argument("--interval-seconds", type=float, default=1.0, help="刷新仓位/权益/杠杆的轮询间隔，默认1秒")
+    p.add_argument("--interval-seconds", type=float, default=1.0, help="后台循环tick间隔，默认1秒")
+    p.add_argument("--exposure-poll-seconds", type=float, default=5.0, help="仓位/权益/杠杆真实API拉取间隔，默认5秒")
+    p.add_argument("--funding-poll-seconds", type=float, default=15.0, help="资金费事件轮询间隔，默认15秒")
     p.add_argument("--record-file", type=Path, default=Path("output/funding_records_stream.csv"))
     p.add_argument("--summary-csv", type=Path, default=Path("output/funding_summary_stream.csv"))
     p.add_argument("--chart-points", type=int, default=120)
@@ -1009,12 +1045,12 @@ def parse_args() -> argparse.Namespace:
 
 def run_web(args: argparse.Namespace) -> int:
     service = FundingService(args)
-    service.run_tick()
+    service.run_tick(force=True)
     service.start_background()
 
     server = ThreadingHTTPServer((args.host, args.port), make_handler(service))
     print(f"[INFO] Web启动: http://{args.host}:{args.port}")
-    print("[INFO] 每秒更新仓位/权益/杠杆；仅新资金费事件会增加样本（默认历史回算）")
+    print(f"[INFO] UI可每秒刷新；真实API频率: exposure={args.exposure_poll_seconds}s, funding={args.funding_poll_seconds}s")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -1028,12 +1064,12 @@ def run_web(args: argparse.Namespace) -> int:
 def run_cli(args: argparse.Namespace) -> int:
     service = FundingService(args)
     if args.once:
-        service.run_tick()
+        service.run_tick(force=True)
         print(json.dumps(service.snapshot_payload()["metrics"], ensure_ascii=False, indent=2))
         return 0
 
     print("[INFO] 持续运行中（Ctrl+C停止）")
-    print("[INFO] 每秒更新仓位/权益/杠杆；仅新资金费事件会增加样本（默认历史回算）")
+    print(f"[INFO] UI可每秒刷新；真实API频率: exposure={args.exposure_poll_seconds}s, funding={args.funding_poll_seconds}s")
     try:
         service.background_loop()
     except KeyboardInterrupt:

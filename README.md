@@ -38,12 +38,15 @@ python binance_funding_monitor.py --web --demo-mode --port 8000
 
 ## 行为说明（重点）
 
-- 仓位价值、账户权益、实际杠杆：按 `--interval-seconds` 轮询更新（默认 1 秒）。
+- 页面可每秒刷新，但真实 API 拉取默认已降频：
+  - 仓位价值/账户权益/杠杆：`--exposure-poll-seconds`（默认 5 秒）
+  - 资金费事件轮询：`--funding-poll-seconds`（默认 15 秒）
 - 样本数（count）：仅在检测到新的 Binance 资金费事件时增加。
 - 历史回算：API 默认读取本地 `record-file` 全量历史；若本地为空且给了开始时间，会自动请求 Binance `income` 历史来回算。
 - 图表：展示回算区间内每条资金费事件样本（净/收到/支付）。
 - 回算建议：为了避免每秒重复拉取历史，区间查询结果会做短时缓存（约30秒）。
 - 若 Binance 历史接口异常，前端会显示 warning，且 `source` 会提示当前是否来自 local/binance。
+- 若遇到 Binance `429/418`，程序会自动退避冷却（5s起步，最大60s）后继续请求，避免持续打满限频。
 
 ---
 
@@ -60,7 +63,9 @@ python binance_funding_monitor.py --web --demo-mode --port 8000
 - `--web`
 - `--host 0.0.0.0`
 - `--port 8000`
-- `--interval-seconds 1`（仓位/权益/杠杆刷新间隔）
+- `--interval-seconds 1`（后台主循环tick间隔）
+- `--exposure-poll-seconds 5`（仓位/权益/杠杆API拉取间隔）
+- `--funding-poll-seconds 15`（资金费事件API轮询间隔）
 - `--record-file output/funding_records_stream.csv`
 - `--summary-csv output/funding_summary_stream.csv`
 - `--chart-points 120`
