@@ -172,6 +172,63 @@ class BinanceClient:
             rows.append({"income": income, "time": t})
         rows.sort(key=lambda x: x["time"])
         return rows
+    def get_funding_incomes_between(self, start_ms: int, end_ms: int | None = None, limit: int = 1000) -> list[dict]:
+        if start_ms <= 0:
+            return []
+
+        end_bound = end_ms if end_ms is not None else int(dt.datetime.now(dt.timezone.utc).timestamp() * 1000)
+        if end_bound < start_ms:
+            return []
+
+        rows: list[dict] = []
+        cursor = start_ms
+        while cursor <= end_bound:
+            data = self._signed_request(
+                INCOME_HISTORY_PATH,
+                {
+                    "incomeType": "FUNDING_FEE",
+                    "startTime": cursor,
+                    "endTime": end_bound,
+                    "limit": limit,
+                },
+            )
+            if not isinstance(data, list) or not data:
+                break
+
+            batch: list[dict] = []
+            for row in data:
+                try:
+                    income = float(row.get("income", 0.0))
+                    t = int(row.get("time", 0))
+                except (TypeError, ValueError):
+                    continue
+                if t < start_ms or t > end_bound:
+                    continue
+                batch.append({"income": income, "time": t})
+
+            if not batch:
+                break
+
+            batch.sort(key=lambda x: x["time"])
+            rows.extend(batch)
+
+            last_t = batch[-1]["time"]
+            next_cursor = last_t + 1
+            if len(batch) < limit or next_cursor <= cursor:
+                break
+            cursor = next_cursor
+
+        rows.sort(key=lambda x: x["time"])
+        deduped: list[dict] = []
+        seen: set[tuple[int, float]] = set()
+        for r in rows:
+            key = (int(r["time"]), float(r["income"]))
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(r)
+        return deduped
+
 
 
 class DemoClient:
@@ -377,6 +434,9 @@ class FundingService:
         now_ms = int(now.timestamp() * 1000)
         self.last_income_time_ms = now_ms
         self.last_funding_sample_time = history_last_time or now
+        self._history_cache_rows: list[dict[str, float | str]] = []
+        self._history_cache_key: tuple[int | None, int | None] | None = None
+        self._history_cache_at = 0.0
 
     def _init_record_file(self, reset: bool) -> None:
         mode = "w" if reset else "a"
@@ -673,8 +733,91 @@ class FundingService:
         ]
         return m, series
 
+    def _rows_from_income_events(self, incomes: list[dict], start: dt.datetime | None, end: dt.datetime | None) -> list[dict[str, float | str]]:
+        if not incomes:
+            return []
+
+        grouped: dict[int, dict[str, float]] = {}
+        for row in incomes:
+            t = int(row.get("time", 0))
+            income = float(row.get("income", 0.0))
+            g = grouped.setdefault(t, {"net": 0.0, "recv": 0.0, "paid": 0.0})
+            g["net"] += income
+            if income >= 0:
+                g["recv"] += income
+            else:
+                g["paid"] += -income
+
+        times = sorted(grouped.keys())
+        if not times:
+            return []
+
+        if len(times) >= 2:
+            default_h = max((times[1] - times[0]) / 3_600_000, 1 / 3600)
+        else:
+            default_h = 8.0
+
+        rows: list[dict[str, float | str]] = []
+        with self.lock:
+            live = self.stats.metrics()
+
+        prev_t: int | None = None
+        for t in times:
+            if prev_t is None:
+                h = default_h
+            else:
+                h = max((t - prev_t) / 3_600_000, 1 / 3600)
+            prev_t = t
+            ts = dt.datetime.fromtimestamp(t / 1000, tz=dt.timezone.utc)
+            if start and ts < start:
+                continue
+            if end and ts > end:
+                continue
+            g = grouped[t]
+            rows.append(
+                {
+                    "timestamp": ts.isoformat(),
+                    "net": g["net"],
+                    "recv": g["recv"],
+                    "paid": g["paid"],
+                    "hours": h,
+                    "position_value": live["position_value"],
+                    "account_equity": live["account_equity"],
+                    "actual_leverage": live["actual_leverage"],
+                }
+            )
+        return rows
+
+    def _load_binance_rows_in_range(self, start: dt.datetime | None, end: dt.datetime | None) -> list[dict[str, float | str]]:
+        if self.client is None or start is None:
+            return []
+
+        start_ms = int(start.timestamp() * 1000)
+        end_ms = int((end or dt.datetime.now(dt.timezone.utc)).timestamp() * 1000)
+        if end_ms < start_ms:
+            return []
+
+        key = (start_ms, end_ms)
+        now = time.time()
+        with self.lock:
+            if self._history_cache_key == key and (now - self._history_cache_at) < 30:
+                return [dict(r) for r in self._history_cache_rows]
+
+        incomes = self.client.get_funding_incomes_between(start_ms=start_ms, end_ms=end_ms)
+        rows = self._rows_from_income_events(incomes, start=start, end=end)
+
+        with self.lock:
+            self._history_cache_key = key
+            self._history_cache_at = now
+            self._history_cache_rows = [dict(r) for r in rows]
+
+        return rows
+
     def snapshot_payload(self, start: dt.datetime | None = None, end: dt.datetime | None = None) -> dict[str, Any]:
         rows = self._load_records_in_range(start, end)
+        if not rows:
+            rows = self._load_binance_rows_in_range(start, end)
+
         if rows:
             metrics, series = self._metrics_from_records(rows)
             with self.lock:
@@ -815,6 +958,9 @@ def make_handler(service: FundingService):
                     end = parse_time_value(q.get("end", [""])[0]) if q.get("end", [""])[0] else None
                 except ValueError:
                     self._send(400, b'{"error":"invalid datetime format"}', "application/json")
+                    return
+                if start and end and end < start:
+                    self._send(400, b'{"error":"end must be >= start"}', "application/json")
                     return
                 payload = service.snapshot_payload(start=start, end=end)
                 self._send(200, json.dumps(payload, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
