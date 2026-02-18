@@ -73,6 +73,8 @@ python binance_funding_monitor.py --web --demo-mode --port 8000
 
 已内置 Binance 服务器时间自动同步。若出现 `-1021`（本地时间超前/滞后）会自动校时并重试一次请求。
 
+另外已对接口返回不完整（`IncompleteRead`）增加自动重试，减少偶发网络抖动导致的 `[WARN] tick failed`。
+
 
 ---
 

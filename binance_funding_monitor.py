@@ -16,6 +16,7 @@ import threading
 import time
 import urllib.parse
 from collections import deque
+from http.client import IncompleteRead
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -58,13 +59,30 @@ class BinanceClient:
         self.recv_window = recv_window
         self.time_offset_ms = 0
 
+    def _load_json(self, req: request.Request, timeout: int = 30, retries: int = 2) -> object:
+        last_exc: Exception | None = None
+        for attempt in range(retries + 1):
+            try:
+                with request.urlopen(req, timeout=timeout) as resp:
+                    payload = resp.read()
+                return json.loads(payload.decode("utf-8"))
+            except (IncompleteRead, json.JSONDecodeError) as exc:
+                last_exc = exc
+                if attempt >= retries:
+                    raise
+                time.sleep(0.2 * (attempt + 1))
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("unexpected json load failure")
+
     def _server_now_ms(self) -> int:
         return int(dt.datetime.now(dt.timezone.utc).timestamp() * 1000) + self.time_offset_ms
 
     def sync_server_time(self) -> None:
         req = request.Request(url=f"{BASE_URL}{SERVER_TIME_PATH}", headers={"User-Agent": "funding-stream/6.0"})
-        with request.urlopen(req, timeout=15) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
+        payload = self._load_json(req, timeout=15, retries=2)
+        if not isinstance(payload, dict):
+            return
         server_ms = int(payload.get("serverTime", 0))
         local_ms = int(dt.datetime.now(dt.timezone.utc).timestamp() * 1000)
         if server_ms > 0:
@@ -79,8 +97,7 @@ class BinanceClient:
             sig = hmac.new(self.api_secret, encoded.encode("utf-8"), hashlib.sha256).hexdigest()
             url = f"{BASE_URL}{path}?{encoded}&signature={sig}"
             req = request.Request(url=url, headers={"X-MBX-APIKEY": self.api_key, "User-Agent": "funding-stream/6.0"})
-            with request.urlopen(req, timeout=30) as resp:
-                return json.loads(resp.read().decode("utf-8"))
+            return self._load_json(req, timeout=30, retries=2)
 
         try:
             return _do_req()
@@ -93,8 +110,7 @@ class BinanceClient:
 
     def _public_request(self, path: str) -> object:
         req = request.Request(url=f"{BASE_URL}{path}", headers={"User-Agent": "funding-stream/6.0"})
-        with request.urlopen(req, timeout=30) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+        return self._load_json(req, timeout=30, retries=2)
 
     def get_positions(self) -> list[dict]:
         data = self._signed_request(POSITION_RISK_PATH, {})
@@ -520,6 +536,8 @@ class FundingService:
             except error.HTTPError as exc:
                 detail = exc.read().decode("utf-8", errors="ignore") if hasattr(exc, "read") else ""
                 print(f"[WARN] tick failed: HTTP {exc.code} {detail}", file=sys.stderr)
+            except IncompleteRead as exc:
+                print(f"[WARN] tick failed: incomplete read ({exc})", file=sys.stderr)
             except Exception as exc:  # noqa: BLE001
                 print(f"[WARN] tick failed: {exc}", file=sys.stderr)
             self.stop_event.wait(self.args.interval_seconds)
