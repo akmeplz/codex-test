@@ -370,6 +370,24 @@ def parse_time_value(value: str) -> dt.datetime:
         parsed = parsed.astimezone(dt.timezone.utc)
     return parsed
 
+def row_pick(row: dict[str, Any], names: tuple[str, ...], default: str = "") -> str:
+    for n in names:
+        v = row.get(n)
+        if v is None:
+            continue
+        text = str(v).strip()
+        if text != "":
+            return text
+    return default
+
+
+def row_pick_float(row: dict[str, Any], names: tuple[str, ...], default: float = 0.0) -> float:
+    text = row_pick(row, names, "")
+    if text == "":
+        return default
+    return float(text)
+
+
 class RunningStats:
     def __init__(self) -> None:
         self.count = 0
@@ -520,14 +538,14 @@ class FundingService:
             reader = csv.DictReader(f)
             for row in reader:
                 try:
-                    ts = parse_time_value(str(row.get("timestamp_utc", "")))
-                    net = float(row.get("realized_net_event", 0.0))
-                    recv = float(row.get("realized_received_event", 0.0))
-                    paid = float(row.get("realized_paid_event", 0.0))
-                    hours = max(float(row.get("event_window_hours", 0.0)), 1 / 3600)
-                    pos = float(row.get("position_value", 0.0))
-                    eq = float(row.get("account_equity", 0.0))
-                    lev = float(row.get("actual_leverage", 0.0))
+                    ts = parse_time_value(row_pick(row, ("timestamp_utc", "timestamp", "time"), ""))
+                    net = row_pick_float(row, ("realized_net_event", "realized_net", "net", "income"), 0.0)
+                    recv = row_pick_float(row, ("realized_received_event", "realized_received", "recv", "received"), 0.0)
+                    paid = row_pick_float(row, ("realized_paid_event", "realized_paid", "paid"), 0.0)
+                    hours = max(row_pick_float(row, ("event_window_hours", "hours", "window_hours"), 0.0), 1 / 3600)
+                    pos = row_pick_float(row, ("position_value", "total_abs_notional", "notional"), 0.0)
+                    eq = row_pick_float(row, ("account_equity", "equity", "total_margin_balance"), 0.0)
+                    lev = row_pick_float(row, ("actual_leverage", "leverage"), 0.0)
                 except (TypeError, ValueError):
                     continue
 
@@ -721,14 +739,14 @@ class FundingService:
             reader = csv.DictReader(f)
             for row in reader:
                 try:
-                    ts = parse_time_value(str(row.get("timestamp_utc", "")))
-                    net = float(row.get("realized_net_event", 0.0))
-                    recv = float(row.get("realized_received_event", 0.0))
-                    paid = float(row.get("realized_paid_event", 0.0))
-                    hours = float(row.get("event_window_hours", 0.0))
-                    pos = float(row.get("position_value", 0.0))
-                    eq = float(row.get("account_equity", 0.0))
-                    lev = float(row.get("actual_leverage", 0.0))
+                    ts = parse_time_value(row_pick(row, ("timestamp_utc", "timestamp", "time"), ""))
+                    net = row_pick_float(row, ("realized_net_event", "realized_net", "net", "income"), 0.0)
+                    recv = row_pick_float(row, ("realized_received_event", "realized_received", "recv", "received"), 0.0)
+                    paid = row_pick_float(row, ("realized_paid_event", "realized_paid", "paid"), 0.0)
+                    hours = row_pick_float(row, ("event_window_hours", "hours", "window_hours"), 0.0)
+                    pos = row_pick_float(row, ("position_value", "total_abs_notional", "notional"), 0.0)
+                    eq = row_pick_float(row, ("account_equity", "equity", "total_margin_balance"), 0.0)
+                    lev = row_pick_float(row, ("actual_leverage", "leverage"), 0.0)
                 except (TypeError, ValueError):
                     continue
 
