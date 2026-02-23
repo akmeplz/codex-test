@@ -9,6 +9,8 @@
 
 默认端口：`8000`。
 
+默认数据目录为 `~/.binance_funding_monitor`（跨重启、跨工作目录更稳定）；若检测到旧路径 `./output/funding_records_stream.csv` 会自动兼容读取。
+
 ---
 
 ## 启动
@@ -70,8 +72,8 @@ python binance_funding_monitor.py --web --demo-mode --port 8000
 - `--exposure-poll-seconds 5`（仓位/权益/杠杆API拉取间隔）
 - `--funding-poll-seconds 15`（资金费事件API轮询间隔）
 - `--min-event-window-hours 8`（避免新事件窗口过短导致小时/日化夸大）
-- `--record-file output/funding_records_stream.csv`
-- `--summary-csv output/funding_summary_stream.csv`
+- `--record-file ~/.binance_funding_monitor/funding_records_stream.csv`
+- `--summary-csv ~/.binance_funding_monitor/funding_summary_stream.csv`
 - `--chart-points 120`
 - `--reset-records`（启动时清空历史记录；默认不清空）
 - `--demo-mode`

@@ -7,6 +7,7 @@ import argparse
 import csv
 import datetime as dt
 import hashlib
+import io
 import hmac
 import json
 import os
@@ -32,6 +33,7 @@ INCOME_HISTORY_PATH = "/fapi/v1/income"
 FUNDING_INFO_PATH = "/fapi/v1/fundingInfo"
 ACCOUNT_INFO_PATH = "/fapi/v2/account"
 SERVER_TIME_PATH = "/fapi/v1/time"
+DEFAULT_DATA_DIR = Path.home() / ".binance_funding_monitor"
 
 
 @dataclass
@@ -362,7 +364,22 @@ def compute_exposure(client: BinanceClient, now: dt.datetime) -> ExposureSnapsho
 
 
 def parse_time_value(value: str) -> dt.datetime:
-    v = value.strip().replace(' ', 'T')
+    raw = value.strip()
+    if raw == "":
+        raise ValueError("empty datetime")
+
+    # unix epoch support (seconds or milliseconds)
+    if raw.isdigit() or (raw.startswith('-') and raw[1:].isdigit()):
+        ts = int(raw)
+        if abs(ts) > 10_000_000_000:
+            ts = ts / 1000
+        parsed = dt.datetime.fromtimestamp(ts, tz=dt.timezone.utc)
+        return parsed
+
+    v = raw.replace('/', '-').replace(' ', 'T')
+    if v.endswith('Z'):
+        v = v[:-1] + '+00:00'
+
     parsed = dt.datetime.fromisoformat(v)
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=dt.timezone.utc)
@@ -370,15 +387,37 @@ def parse_time_value(value: str) -> dt.datetime:
         parsed = parsed.astimezone(dt.timezone.utc)
     return parsed
 
+
 def row_pick(row: dict[str, Any], names: tuple[str, ...], default: str = "") -> str:
-    for n in names:
-        v = row.get(n)
+    target = {n.strip().lower() for n in names}
+    for k, v in row.items():
+        nk = str(k).replace('﻿', '').strip().lower()
+        if nk not in target:
+            continue
         if v is None:
             continue
         text = str(v).strip()
         if text != "":
             return text
     return default
+
+
+def iter_csv_rows(path: Path) -> list[dict[str, str]]:
+    if not path.exists():
+        return []
+    text = path.read_text(encoding='utf-8', errors='ignore')
+    if not text.strip():
+        return []
+
+    sample = text[:4096]
+    try:
+        dialect = csv.Sniffer().sniff(sample, delimiters=',;	|')
+        delim = dialect.delimiter
+    except Exception:
+        delim = ','
+
+    reader = csv.DictReader(io.StringIO(text), delimiter=delim)
+    return [dict(r) for r in reader]
 
 
 def row_pick_float(row: dict[str, Any], names: tuple[str, ...], default: float = 0.0) -> float:
@@ -476,6 +515,11 @@ class FundingService:
         self.record_file.parent.mkdir(parents=True, exist_ok=True)
         self.summary_csv.parent.mkdir(parents=True, exist_ok=True)
 
+        self.source_record_files: list[Path] = [self.record_file]
+        legacy_default = Path("output/funding_records_stream.csv")
+        if self.record_file.resolve() != legacy_default.resolve() and legacy_default.exists():
+            self.source_record_files.append(legacy_default)
+
         if args.reset_records:
             self._init_record_file(reset=True)
         elif (not self.record_file.exists()) or self.record_file.stat().st_size == 0:
@@ -530,13 +574,11 @@ class FundingService:
                 )
 
     def _bootstrap_from_records(self) -> dt.datetime | None:
-        if not self.record_file.exists():
-            return None
-
         last_ts: dt.datetime | None = None
-        with self.record_file.open("r", newline="", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
+        for file in self.source_record_files:
+            if not file.exists():
+                continue
+            for row in iter_csv_rows(file):
                 try:
                     ts = parse_time_value(row_pick(row, ("timestamp_utc", "timestamp", "time"), ""))
                     net = row_pick_float(row, ("realized_net_event", "realized_net", "net", "income"), 0.0)
@@ -731,13 +773,11 @@ class FundingService:
         start: dt.datetime | None,
         end: dt.datetime | None,
     ) -> list[dict[str, float | str]]:
-        if not self.record_file.exists():
-            return []
-
         rows: list[dict[str, float | str]] = []
-        with self.record_file.open("r", newline="", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
+        for file in self.source_record_files:
+            if not file.exists():
+                continue
+            for row in iter_csv_rows(file):
                 try:
                     ts = parse_time_value(row_pick(row, ("timestamp_utc", "timestamp", "time"), ""))
                     net = row_pick_float(row, ("realized_net_event", "realized_net", "net", "income"), 0.0)
@@ -1144,8 +1184,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--exposure-poll-seconds", type=float, default=5.0, help="仓位/权益/杠杆真实API拉取间隔，默认5秒")
     p.add_argument("--funding-poll-seconds", type=float, default=15.0, help="资金费事件轮询间隔，默认15秒")
     p.add_argument("--min-event-window-hours", type=float, default=8.0, help="资金费事件换算的最小窗口小时，默认8小时")
-    p.add_argument("--record-file", type=Path, default=Path("output/funding_records_stream.csv"))
-    p.add_argument("--summary-csv", type=Path, default=Path("output/funding_summary_stream.csv"))
+    p.add_argument("--record-file", type=Path, default=DEFAULT_DATA_DIR / "funding_records_stream.csv")
+    p.add_argument("--summary-csv", type=Path, default=DEFAULT_DATA_DIR / "funding_summary_stream.csv")
     p.add_argument("--chart-points", type=int, default=120)
     p.add_argument("--reset-records", action="store_true", help="启动时清空本地记录；默认保留并可回溯")
     p.add_argument("--demo-mode", action="store_true")
