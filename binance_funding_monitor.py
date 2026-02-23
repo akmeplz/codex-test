@@ -435,6 +435,10 @@ class RunningStats:
             "pnl_rate_daily": pnl_daily,
             "pnl_rate_monthly": pnl_daily * 30,
             "pnl_rate_yearly": pnl_daily * 365,
+            "realized_rate_daily": pnl_daily,
+            "realized_rate_yearly": pnl_daily * 365,
+            "estimated_rate_daily": rate_h * 24,
+            "estimated_rate_yearly": rate_h * 24 * 365,
             "rate_daily": rate_h * 24,
             "rate_yearly": rate_h * 24 * 365,
             "avg_estimated_hourly_fee": self.estimated_hourly_sum / max(self.count, 1),
@@ -769,6 +773,8 @@ class FundingService:
                     "pnl_rate_daily": 0.0,
                     "pnl_rate_monthly": 0.0,
                     "pnl_rate_yearly": 0.0,
+                    "realized_rate_daily": 0.0,
+                    "realized_rate_yearly": 0.0,
                 }
             )
             return m, []
@@ -817,6 +823,8 @@ class FundingService:
                 "pnl_rate_daily": pnl_daily,
                 "pnl_rate_monthly": pnl_daily * 30,
                 "pnl_rate_yearly": pnl_daily * 365,
+                "realized_rate_daily": pnl_daily,
+                "realized_rate_yearly": pnl_daily * 365,
             }
         )
 
@@ -946,6 +954,8 @@ class FundingService:
                     "position_value": live["position_value"],
                     "account_equity": live["account_equity"],
                     "actual_leverage": live["actual_leverage"],
+                    "estimated_rate_daily": live["estimated_rate_daily"],
+                    "estimated_rate_yearly": live["estimated_rate_yearly"],
                     "rate_daily": live["rate_daily"],
                     "rate_yearly": live["rate_yearly"],
                     "avg_estimated_hourly_fee": live["avg_estimated_hourly_fee"],
@@ -1009,11 +1019,13 @@ const labels=[
 ['pnl_rate_daily','日化收益率(净日化/仓位价值)'],
 ['pnl_rate_monthly','月化收益率'],
 ['pnl_rate_yearly','年化收益率'],
-['rate_daily','费率日化(%)'],
-['rate_yearly','费率年化(%)']
+['realized_rate_daily','已实现费率日化(基于历史资金费)'],
+['realized_rate_yearly','已实现费率年化'],
+['estimated_rate_daily','预计费率日化(基于当前持仓)'],
+['estimated_rate_yearly','预计费率年化']
 ];
 function fmt(k,v){
-  if(['rate_daily','rate_yearly','pnl_rate_daily','pnl_rate_monthly','pnl_rate_yearly'].includes(k)) return (v*100).toFixed(4)+'%';
+  if(['rate_daily','rate_yearly','estimated_rate_daily','estimated_rate_yearly','realized_rate_daily','realized_rate_yearly','pnl_rate_daily','pnl_rate_monthly','pnl_rate_yearly'].includes(k)) return (v*100).toFixed(4)+'%';
   if(k==='count') return String(Math.round(v));
   if(k==='actual_leverage') return Number(v).toFixed(4)+'x';
   return Number(v).toFixed(6);
