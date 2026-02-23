@@ -953,11 +953,18 @@ class FundingService:
             )
             return {"metrics": metrics, "series": series, "source": source}
 
-        with self.lock:
-            payload = {"metrics": self.stats.metrics(), "series": list(self.series), "source": source}
+        if start is not None or end is not None:
+            metrics, series = self._metrics_from_records([])
+            payload = {"metrics": metrics, "series": series, "source": source}
             if self._history_cache_error and start is not None:
                 payload["warning"] = f"binance history query failed: {self._history_cache_error}"
             return payload
+
+        with self.lock:
+            live_metrics = self.stats.metrics()
+            live_series = list(self.series)
+        payload_source = "live" if (live_metrics.get("count", 0.0) > 0 or live_series) else "none"
+        return {"metrics": live_metrics, "series": live_series, "source": payload_source}
 
 
 def build_html() -> str:
