@@ -463,10 +463,10 @@ class RunningStats:
         if self.count == 0:
             net_h = recv_h = paid_h = 0.0
         else:
-            hours = self.total_hours if self.total_hours > 0 else 1.0
-            net_h = self.net / hours
-            recv_h = self.received / hours
-            paid_h = self.paid / hours
+            sample_count = float(self.count)
+            net_h = self.net / sample_count
+            recv_h = self.received / sample_count
+            paid_h = self.paid / sample_count
 
         net_daily = net_h * 24
         recv_daily = recv_h * 24
@@ -897,11 +897,11 @@ class FundingService:
         paid_total = sum(float(r["paid"]) for r in rows)
         total_hours = sum(resolved_hours)
         if total_hours <= 0:
-            total_hours = max(count / 24.0, self.args.min_event_window_hours)
+            total_hours = max(count, self.args.min_event_window_hours)
 
-        net_h = net_total / total_hours
-        recv_h = recv_total / total_hours
-        paid_h = paid_total / total_hours
+        net_h = net_total / count
+        recv_h = recv_total / count
+        paid_h = paid_total / count
         net_daily = net_h * 24
         recv_daily = recv_h * 24
         paid_daily = paid_h * 24
