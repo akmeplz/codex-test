@@ -809,6 +809,59 @@ class FundingService:
                 )
         return rows
 
+    def _resolve_row_hours(self, rows: list[dict[str, float | str]]) -> list[float]:
+        if not rows:
+            return []
+
+        times: list[dt.datetime | None] = []
+        for r in rows:
+            try:
+                times.append(parse_time_value(str(r["timestamp"])))
+            except Exception:  # noqa: BLE001
+                times.append(None)
+
+        deltas: list[float] = []
+        for i in range(1, len(times)):
+            a, b = times[i - 1], times[i]
+            if a is None or b is None:
+                continue
+            d = (b - a).total_seconds() / 3600.0
+            if d > 0:
+                deltas.append(d)
+
+        if deltas:
+            sorted_d = sorted(deltas)
+            mid = len(sorted_d) // 2
+            default_h = sorted_d[mid] if len(sorted_d) % 2 == 1 else (sorted_d[mid - 1] + sorted_d[mid]) / 2
+        else:
+            default_h = 8.0
+
+        out: list[float] = []
+        for i, r in enumerate(rows):
+            try:
+                raw_h = float(r["hours"])
+            except Exception:  # noqa: BLE001
+                raw_h = 0.0
+
+            h = raw_h
+            if h <= 0:
+                prev_h = next_h = 0.0
+                if i > 0 and times[i - 1] is not None and times[i] is not None:
+                    prev_h = (times[i] - times[i - 1]).total_seconds() / 3600.0
+                if i + 1 < len(times) and times[i + 1] is not None and times[i] is not None:
+                    next_h = (times[i + 1] - times[i]).total_seconds() / 3600.0
+                if prev_h > 0:
+                    h = prev_h
+                elif next_h > 0:
+                    h = next_h
+                else:
+                    h = default_h
+
+            h = max(h, self.args.min_event_window_hours)
+            out.append(h)
+
+        return out
+
     def _metrics_from_records(self, rows: list[dict[str, float | str]]) -> tuple[dict[str, float], list[dict[str, str | float]]]:
         with self.lock:
             base = self.stats.metrics()
@@ -838,10 +891,11 @@ class FundingService:
             return m, []
 
         count = float(len(rows))
+        resolved_hours = self._resolve_row_hours(rows)
         net_total = sum(float(r["net"]) for r in rows)
         recv_total = sum(float(r["recv"]) for r in rows)
         paid_total = sum(float(r["paid"]) for r in rows)
-        total_hours = sum(max(float(r["hours"]), self.args.min_event_window_hours) for r in rows)
+        total_hours = sum(resolved_hours)
         if total_hours <= 0:
             total_hours = max(count / 24.0, self.args.min_event_window_hours)
 
@@ -852,9 +906,9 @@ class FundingService:
         recv_daily = recv_h * 24
         paid_daily = paid_h * 24
 
-        weighted_pos = sum(max(float(r["hours"]), self.args.min_event_window_hours) * float(r["position_value"]) for r in rows)
-        weighted_eq = sum(max(float(r["hours"]), self.args.min_event_window_hours) * float(r["account_equity"]) for r in rows)
-        weighted_lev = sum(max(float(r["hours"]), self.args.min_event_window_hours) * float(r["actual_leverage"]) for r in rows)
+        weighted_pos = sum(h * float(r["position_value"]) for h, r in zip(resolved_hours, rows))
+        weighted_eq = sum(h * float(r["account_equity"]) for h, r in zip(resolved_hours, rows))
+        weighted_lev = sum(h * float(r["actual_leverage"]) for h, r in zip(resolved_hours, rows))
 
         position_value = weighted_pos / total_hours if total_hours > 0 else 0.0
         account_equity = weighted_eq / total_hours if total_hours > 0 else 0.0
@@ -889,11 +943,11 @@ class FundingService:
         series = [
             {
                 "timestamp": str(r["timestamp"]),
-                "net_hourly": float(r["net"]) / max(float(r["hours"]), self.args.min_event_window_hours),
-                "received_hourly": float(r["recv"]) / max(float(r["hours"]), self.args.min_event_window_hours),
-                "paid_hourly": float(r["paid"]) / max(float(r["hours"]), self.args.min_event_window_hours),
+                "net_hourly": float(r["net"]) / h,
+                "received_hourly": float(r["recv"]) / h,
+                "paid_hourly": float(r["paid"]) / h,
             }
-            for r in rows
+            for r, h in zip(rows, resolved_hours)
         ]
         return m, series
 
@@ -1181,7 +1235,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--interval-seconds", type=float, default=1.0, help="后台循环tick间隔，默认1秒")
     p.add_argument("--exposure-poll-seconds", type=float, default=5.0, help="仓位/权益/杠杆真实API拉取间隔，默认5秒")
     p.add_argument("--funding-poll-seconds", type=float, default=15.0, help="资金费事件轮询间隔，默认15秒")
-    p.add_argument("--min-event-window-hours", type=float, default=8.0, help="资金费事件换算的最小窗口小时，默认8小时")
+    p.add_argument("--min-event-window-hours", type=float, default=0.25, help="资金费事件换算的最小窗口小时，默认0.25小时")
     p.add_argument("--record-file", type=Path, default=DEFAULT_DATA_DIR / "funding_records_stream.csv")
     p.add_argument("--summary-csv", type=Path, default=DEFAULT_DATA_DIR / "funding_summary_stream.csv")
     p.add_argument("--chart-points", type=int, default=120)
