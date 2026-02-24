@@ -435,6 +435,34 @@ def compute_hourly_by_sample_count(count: float, net_total: float, recv_total: f
     return net_total / count, recv_total / count, paid_total / count
 
 
+
+
+def normalize_sample_count_daily_metrics(metrics: dict[str, float]) -> dict[str, float]:
+    count = float(metrics.get("count", 0.0) or 0.0)
+    net_total = float(metrics.get("net_total", 0.0) or 0.0)
+    recv_total = float(metrics.get("received_total", 0.0) or 0.0)
+    paid_total = float(metrics.get("paid_total", 0.0) or 0.0)
+    net_h, recv_h, paid_h = compute_hourly_by_sample_count(count, net_total, recv_total, paid_total)
+    net_daily = net_h * 24
+    recv_daily = recv_h * 24
+    paid_daily = paid_h * 24
+    position_value = float(metrics.get("position_value", 0.0) or 0.0)
+    pnl_daily = net_daily / position_value if position_value > 0 else 0.0
+
+    metrics["net_hourly"] = net_h
+    metrics["received_hourly"] = recv_h
+    metrics["paid_hourly"] = paid_h
+    metrics["net_daily"] = net_daily
+    metrics["received_daily"] = recv_daily
+    metrics["paid_daily"] = paid_daily
+    metrics["pnl_rate_daily"] = pnl_daily
+    metrics["pnl_rate_monthly"] = pnl_daily * 30
+    metrics["pnl_rate_yearly"] = pnl_daily * 365
+    metrics["realized_rate_daily"] = pnl_daily
+    metrics["realized_rate_yearly"] = pnl_daily * 365
+    return metrics
+
+
 class RunningStats:
     def __init__(self) -> None:
         self.count = 0
@@ -1073,10 +1101,12 @@ class FundingService:
                     "avg_estimated_hourly_fee": live["avg_estimated_hourly_fee"],
                 }
             )
+            metrics = normalize_sample_count_daily_metrics(metrics)
             return {"metrics": metrics, "series": series, "source": source}
 
         if start is not None or end is not None:
             metrics, series = self._metrics_from_records([])
+            metrics = normalize_sample_count_daily_metrics(metrics)
             payload = {"metrics": metrics, "series": series, "source": source}
             if self._history_cache_error and start is not None:
                 payload["warning"] = f"binance history query failed: {self._history_cache_error}"
@@ -1085,6 +1115,7 @@ class FundingService:
         with self.lock:
             live_metrics = self.stats.metrics()
             live_series = list(self.series)
+        live_metrics = normalize_sample_count_daily_metrics(live_metrics)
         payload_source = "live" if (live_metrics.get("count", 0.0) > 0 or live_series) else "none"
         return {"metrics": live_metrics, "series": live_series, "source": payload_source}
 
