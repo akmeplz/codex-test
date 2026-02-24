@@ -427,6 +427,14 @@ def row_pick_float(row: dict[str, Any], names: tuple[str, ...], default: float =
     return float(text)
 
 
+
+
+def compute_hourly_by_sample_count(count: float, net_total: float, recv_total: float, paid_total: float) -> tuple[float, float, float]:
+    if count <= 0:
+        return 0.0, 0.0, 0.0
+    return net_total / count, recv_total / count, paid_total / count
+
+
 class RunningStats:
     def __init__(self) -> None:
         self.count = 0
@@ -460,13 +468,7 @@ class RunningStats:
         self.paid += ev.realized_paid
 
     def metrics(self) -> dict[str, float]:
-        if self.count == 0:
-            net_h = recv_h = paid_h = 0.0
-        else:
-            sample_count = float(self.count)
-            net_h = self.net / sample_count
-            recv_h = self.received / sample_count
-            paid_h = self.paid / sample_count
+        net_h, recv_h, paid_h = compute_hourly_by_sample_count(float(self.count), self.net, self.received, self.paid)
 
         net_daily = net_h * 24
         recv_daily = recv_h * 24
@@ -899,9 +901,7 @@ class FundingService:
         if total_hours <= 0:
             total_hours = max(count, self.args.min_event_window_hours)
 
-        net_h = net_total / count
-        recv_h = recv_total / count
-        paid_h = paid_total / count
+        net_h, recv_h, paid_h = compute_hourly_by_sample_count(count, net_total, recv_total, paid_total)
         net_daily = net_h * 24
         recv_daily = recv_h * 24
         paid_daily = paid_h * 24
