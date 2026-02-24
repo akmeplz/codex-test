@@ -1077,8 +1077,6 @@ const labels=[
 ['pnl_rate_daily','日化收益率(净日化/仓位价值)'],
 ['pnl_rate_monthly','月化收益率'],
 ['pnl_rate_yearly','年化收益率'],
-['realized_rate_daily','已实现费率日化(基于历史资金费)'],
-['realized_rate_yearly','已实现费率年化'],
 ['estimated_rate_daily','预计费率日化(基于当前持仓)'],
 ['estimated_rate_yearly','预计费率年化']
 ];
