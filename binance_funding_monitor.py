@@ -463,6 +463,34 @@ def normalize_sample_count_daily_metrics(metrics: dict[str, float]) -> dict[str,
     return metrics
 
 
+
+
+def build_series_point(timestamp: str, net: float, recv: float, paid: float, hours: float) -> dict[str, str | float]:
+    denom = hours if hours > 0 else 1.0
+    return {
+        "timestamp": timestamp,
+        "net_hourly": net / denom,
+        "received_hourly": recv / denom,
+        "paid_hourly": paid / denom,
+    }
+
+
+def overlay_live_exposure_fields(metrics: dict[str, float], live: dict[str, float]) -> dict[str, float]:
+    metrics.update(
+        {
+            "position_value": live["position_value"],
+            "account_equity": live["account_equity"],
+            "actual_leverage": live["actual_leverage"],
+            "estimated_rate_daily": live["estimated_rate_daily"],
+            "estimated_rate_yearly": live["estimated_rate_yearly"],
+            "rate_daily": live["rate_daily"],
+            "rate_yearly": live["rate_yearly"],
+            "avg_estimated_hourly_fee": live["avg_estimated_hourly_fee"],
+        }
+    )
+    return metrics
+
+
 class RunningStats:
     def __init__(self) -> None:
         self.count = 0
@@ -630,14 +658,7 @@ class FundingService:
                         event_window_hours=hours,
                     )
                 )
-                self.series.append(
-                    {
-                        "timestamp": ts.isoformat(),
-                        "net_hourly": net / hours,
-                        "received_hourly": recv / hours,
-                        "paid_hourly": paid / hours,
-                    }
-                )
+                self.series.append(build_series_point(ts.isoformat(), net, recv, paid, hours))
 
                 self.stats.position_value = pos
                 self.stats.account_equity = eq
@@ -738,12 +759,13 @@ class FundingService:
         with self.lock:
             self.stats.update_funding_event(ev)
             self.series.append(
-                {
-                    "timestamp": now.isoformat(),
-                    "net_hourly": ev.realized_net / ev.event_window_hours,
-                    "received_hourly": ev.realized_received / ev.event_window_hours,
-                    "paid_hourly": ev.realized_paid / ev.event_window_hours,
-                }
+                build_series_point(
+                    now.isoformat(),
+                    ev.realized_net,
+                    ev.realized_received,
+                    ev.realized_paid,
+                    ev.event_window_hours,
+                )
             )
             self.append_funding_record(ev, ex)
             self.write_summary(self.stats.metrics())
@@ -969,12 +991,13 @@ class FundingService:
         )
 
         series = [
-            {
-                "timestamp": str(r["timestamp"]),
-                "net_hourly": float(r["net"]) / h,
-                "received_hourly": float(r["recv"]) / h,
-                "paid_hourly": float(r["paid"]) / h,
-            }
+            build_series_point(
+                str(r["timestamp"]),
+                float(r["net"]),
+                float(r["recv"]),
+                float(r["paid"]),
+                h,
+            )
             for r, h in zip(rows, resolved_hours)
         ]
         return m, series
@@ -1089,18 +1112,7 @@ class FundingService:
             metrics, series = self._metrics_from_records(rows)
             with self.lock:
                 live = self.stats.metrics()
-            metrics.update(
-                {
-                    "position_value": live["position_value"],
-                    "account_equity": live["account_equity"],
-                    "actual_leverage": live["actual_leverage"],
-                    "estimated_rate_daily": live["estimated_rate_daily"],
-                    "estimated_rate_yearly": live["estimated_rate_yearly"],
-                    "rate_daily": live["rate_daily"],
-                    "rate_yearly": live["rate_yearly"],
-                    "avg_estimated_hourly_fee": live["avg_estimated_hourly_fee"],
-                }
-            )
+            metrics = overlay_live_exposure_fields(metrics, live)
             metrics = normalize_sample_count_daily_metrics(metrics)
             return {"metrics": metrics, "series": series, "source": source}
 
