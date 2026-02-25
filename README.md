@@ -44,6 +44,7 @@ python binance_funding_monitor.py --web --demo-mode --port 8000
   - 仓位价值/账户权益/杠杆：`--exposure-poll-seconds`（默认 5 秒）
   - 资金费事件轮询：`--funding-poll-seconds`（默认 15 秒）
 - 样本数（count）：仅在检测到新的 Binance 资金费事件时增加。
+- 对同一结算时段内时间非常接近的资金费流水会自动合并为一个样本（默认10分钟窗口，可用 `--event-merge-seconds` 调整），避免在 00/08/16 点附近出现“同一轮结算 +2”。
 - 对新事件的小时化换算增加最小窗口小时保护（默认0.25小时，仅用于防止分母趋近0），防止新增第一条样本时因时间差过小导致收益率异常放大。
 - 每小时与日化按用户口径计算：净/收到/支付每小时都使用“对应累计资金费/样本数（仅资金费事件）”，日化=每小时*24；样本窗口仅用于仓位/权益/杠杆加权。
 - 历史回算：API 默认读取本地 `record-file` 全量历史；若本地为空且给了开始时间，会自动请求 Binance `income` 历史来回算。
@@ -79,6 +80,7 @@ python binance_funding_monitor.py --web --demo-mode --port 8000
 - `--interval-seconds 1`（后台主循环tick间隔）
 - `--exposure-poll-seconds 5`（仓位/权益/杠杆API拉取间隔）
 - `--funding-poll-seconds 15`（资金费事件API轮询间隔）
+- `--event-merge-seconds 600`（将相近时间流水合并为单样本，默认10分钟）
 - `--min-event-window-hours 0.25`（避免新事件窗口过短导致小时/日化夸大）
 - `--record-file ~/.binance_funding_monitor/funding_records_stream.csv`
 - `--summary-csv ~/.binance_funding_monitor/funding_summary_stream.csv`

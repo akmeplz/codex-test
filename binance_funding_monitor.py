@@ -718,6 +718,44 @@ class FundingService:
             self.write_summary(self.stats.metrics())
         return ex
 
+    def _merge_income_rows(self, rows: list[dict[str, float]]) -> list[dict[str, float]]:
+        if not rows:
+            return []
+        merge_ms = max(int(self.args.event_merge_seconds * 1000), 0)
+        if merge_ms <= 0:
+            return [{"time": int(r["time"]), "income": float(r["income"])} for r in rows]
+
+        out: list[dict[str, float]] = []
+        current_time = int(rows[0]["time"])
+        current_income = float(rows[0]["income"])
+        for r in rows[1:]:
+            t = int(r["time"])
+            income = float(r["income"])
+            if t - current_time <= merge_ms:
+                current_income += income
+                current_time = max(current_time, t)
+            else:
+                out.append({"time": current_time, "income": current_income})
+                current_time = t
+                current_income = income
+        out.append({"time": current_time, "income": current_income})
+        return out
+
+    def _event_from_income_group(self, rows: list[dict[str, float]], ex: ExposureSnapshot, now: dt.datetime) -> FundingEventSnapshot:
+        latest_time = max(int(r["time"]) for r in rows)
+        net = sum(float(r["income"]) for r in rows)
+        recv = sum(float(r["income"]) for r in rows if float(r["income"]) >= 0)
+        paid = sum(-float(r["income"]) for r in rows if float(r["income"]) < 0)
+        floor_h = max(self.args.min_event_window_hours, ex.expected_event_window_hours)
+        elapsed_h = max((latest_time - self.last_income_time_ms) / 3_600_000.0, floor_h)
+        return FundingEventSnapshot(
+            timestamp=now,
+            realized_net=net,
+            realized_received=recv,
+            realized_paid=paid,
+            event_window_hours=elapsed_h,
+        )
+
     def poll_funding_event(self, ex: ExposureSnapshot, force: bool = False) -> None:
         now_ts = time.time()
         if (not force) and (now_ts - self._last_funding_poll_at) < self.args.funding_poll_seconds:
@@ -739,39 +777,28 @@ class FundingService:
         if not rows:
             return
 
-        latest_time = max(r["time"] for r in rows)
-        net = sum(r["income"] for r in rows)
-        recv = sum(r["income"] for r in rows if r["income"] >= 0)
-        paid = sum(-r["income"] for r in rows if r["income"] < 0)
+        merged = self._merge_income_rows(rows)
+        if not merged:
+            return
 
         now = dt.datetime.now(dt.timezone.utc)
-        floor_h = max(self.args.min_event_window_hours, ex.expected_event_window_hours)
-        elapsed_h = max((latest_time - self.last_income_time_ms) / 3_600_000.0, floor_h)
-
-        ev = FundingEventSnapshot(
-            timestamp=now,
-            realized_net=net,
-            realized_received=recv,
-            realized_paid=paid,
-            event_window_hours=elapsed_h,
-        )
-
-        with self.lock:
-            self.stats.update_funding_event(ev)
-            self.series.append(
-                build_series_point(
-                    now.isoformat(),
-                    ev.realized_net,
-                    ev.realized_received,
-                    ev.realized_paid,
-                    ev.event_window_hours,
+        for item in merged:
+            ev = self._event_from_income_group([item], ex, now)
+            with self.lock:
+                self.stats.update_funding_event(ev)
+                self.series.append(
+                    build_series_point(
+                        now.isoformat(),
+                        ev.realized_net,
+                        ev.realized_received,
+                        ev.realized_paid,
+                        ev.event_window_hours,
+                    )
                 )
-            )
-            self.append_funding_record(ev, ex)
-            self.write_summary(self.stats.metrics())
-
-        self.last_income_time_ms = latest_time
-        self.last_funding_sample_time = now
+                self.append_funding_record(ev, ex)
+                self.write_summary(self.stats.metrics())
+            self.last_income_time_ms = int(item["time"])
+            self.last_funding_sample_time = now
 
     def run_tick(self, force: bool = False) -> None:
         ex = self.refresh_exposure(force=force)
@@ -1278,6 +1305,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--interval-seconds", type=float, default=1.0, help="后台循环tick间隔，默认1秒")
     p.add_argument("--exposure-poll-seconds", type=float, default=5.0, help="仓位/权益/杠杆真实API拉取间隔，默认5秒")
     p.add_argument("--funding-poll-seconds", type=float, default=15.0, help="资金费事件轮询间隔，默认15秒")
+    p.add_argument("--event-merge-seconds", type=float, default=600.0, help="将相近时间资金费流水合并为一个样本（秒），默认600")
     p.add_argument("--min-event-window-hours", type=float, default=0.25, help="资金费事件换算的最小窗口小时，默认0.25小时")
     p.add_argument("--record-file", type=Path, default=DEFAULT_DATA_DIR / "funding_records_stream.csv")
     p.add_argument("--summary-csv", type=Path, default=DEFAULT_DATA_DIR / "funding_summary_stream.csv")
