@@ -632,38 +632,35 @@ class FundingService:
                 )
 
     def _bootstrap_from_records(self) -> dt.datetime | None:
+        rows = self._load_records_in_range(None, None)
+        if not rows:
+            return None
+
         last_ts: dt.datetime | None = None
-        for file in self.source_record_files:
-            if not file.exists():
-                continue
-            for row in iter_csv_rows(file):
-                try:
-                    ts = parse_time_value(row_pick(row, ("timestamp_utc", "timestamp", "time"), ""))
-                    net = row_pick_float(row, ("realized_net_event", "realized_net", "net", "income"), 0.0)
-                    recv = row_pick_float(row, ("realized_received_event", "realized_received", "recv", "received"), 0.0)
-                    paid = row_pick_float(row, ("realized_paid_event", "realized_paid", "paid"), 0.0)
-                    hours = max(row_pick_float(row, ("event_window_hours", "hours", "window_hours"), 0.0), 1 / 3600)
-                    pos = row_pick_float(row, ("position_value", "total_abs_notional", "notional"), 0.0)
-                    eq = row_pick_float(row, ("account_equity", "equity", "total_margin_balance"), 0.0)
-                    lev = row_pick_float(row, ("actual_leverage", "leverage"), 0.0)
-                except (TypeError, ValueError):
-                    continue
+        for r in rows:
+            ts = parse_time_value(str(r["timestamp"]))
+            net = float(r["net"])
+            recv = float(r["recv"])
+            paid = float(r["paid"])
+            hours = max(float(r["hours"]), 1 / 3600)
+            pos = float(r["position_value"])
+            eq = float(r["account_equity"])
+            lev = float(r["actual_leverage"])
 
-                self.stats.update_funding_event(
-                    FundingEventSnapshot(
-                        timestamp=ts,
-                        realized_net=net,
-                        realized_received=recv,
-                        realized_paid=paid,
-                        event_window_hours=hours,
-                    )
+            self.stats.update_funding_event(
+                FundingEventSnapshot(
+                    timestamp=ts,
+                    realized_net=net,
+                    realized_received=recv,
+                    realized_paid=paid,
+                    event_window_hours=hours,
                 )
-                self.series.append(build_series_point(ts.isoformat(), net, recv, paid, hours))
-
-                self.stats.position_value = pos
-                self.stats.account_equity = eq
-                self.stats.actual_leverage = lev
-                last_ts = ts
+            )
+            self.series.append(build_series_point(ts.isoformat(), net, recv, paid, hours))
+            self.stats.position_value = pos
+            self.stats.account_equity = eq
+            self.stats.actual_leverage = lev
+            last_ts = ts
 
         return last_ts
 
@@ -886,7 +883,80 @@ class FundingService:
                         "actual_leverage": lev,
                     }
                 )
-        return rows
+        return self._merge_record_rows(rows)
+
+    def _merge_record_rows(self, rows: list[dict[str, float | str]]) -> list[dict[str, float | str]]:
+        if not rows:
+            return []
+
+        merge_seconds = max(float(self.args.event_merge_seconds), 0.0)
+        if merge_seconds <= 0:
+            return sorted(rows, key=lambda r: str(r["timestamp"]))
+
+        merge_ms = int(merge_seconds * 1000)
+        ordered = sorted(rows, key=lambda r: str(r["timestamp"]))
+
+        def safe_hours(v: float) -> float:
+            return max(float(v), self.args.min_event_window_hours)
+
+        out: list[dict[str, float | str]] = []
+        cur_ts = parse_time_value(str(ordered[0]["timestamp"]))
+        cur_net = float(ordered[0]["net"])
+        cur_recv = float(ordered[0]["recv"])
+        cur_paid = float(ordered[0]["paid"])
+        cur_hours = float(ordered[0]["hours"])
+        w = safe_hours(cur_hours)
+        pos_wsum = float(ordered[0]["position_value"]) * w
+        eq_wsum = float(ordered[0]["account_equity"]) * w
+        lev_wsum = float(ordered[0]["actual_leverage"]) * w
+        total_w = w
+
+        def flush() -> None:
+            pos = pos_wsum / total_w if total_w > 0 else 0.0
+            eq = eq_wsum / total_w if total_w > 0 else 0.0
+            lev = lev_wsum / total_w if total_w > 0 else 0.0
+            out.append(
+                {
+                    "timestamp": cur_ts.isoformat(),
+                    "net": cur_net,
+                    "recv": cur_recv,
+                    "paid": cur_paid,
+                    "hours": cur_hours,
+                    "position_value": pos,
+                    "account_equity": eq,
+                    "actual_leverage": lev,
+                }
+            )
+
+        for r in ordered[1:]:
+            ts = parse_time_value(str(r["timestamp"]))
+            diff_ms = int((ts - cur_ts).total_seconds() * 1000)
+            if diff_ms <= merge_ms:
+                cur_ts = ts
+                cur_net += float(r["net"])
+                cur_recv += float(r["recv"])
+                cur_paid += float(r["paid"])
+                cur_hours += float(r["hours"])
+                rw = safe_hours(float(r["hours"]))
+                total_w += rw
+                pos_wsum += float(r["position_value"]) * rw
+                eq_wsum += float(r["account_equity"]) * rw
+                lev_wsum += float(r["actual_leverage"]) * rw
+            else:
+                flush()
+                cur_ts = ts
+                cur_net = float(r["net"])
+                cur_recv = float(r["recv"])
+                cur_paid = float(r["paid"])
+                cur_hours = float(r["hours"])
+                rw = safe_hours(cur_hours)
+                total_w = rw
+                pos_wsum = float(r["position_value"]) * rw
+                eq_wsum = float(r["account_equity"]) * rw
+                lev_wsum = float(r["actual_leverage"]) * rw
+
+        flush()
+        return out
 
     def _resolve_row_hours(self, rows: list[dict[str, float | str]]) -> list[float]:
         if not rows:
